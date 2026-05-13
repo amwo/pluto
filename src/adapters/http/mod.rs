@@ -23,6 +23,26 @@ impl Http {
         }
     }
 
+    pub async fn get_slot(&self) -> Result<u64> {
+        let response: Value = self
+            .client
+            .post(&self.endpoint.url)
+            .basic_auth(&self.endpoint.username, Some(&self.endpoint.password))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        response["result"]
+            .as_u64()
+            .context("missing slot in response")
+    }
+
     pub async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
         let response: Value = self
             .client

@@ -60,4 +60,5 @@ pub struct ObservedTrade {
     pub jito_marker: bool,
     pub priority_fee_lamports: u64,
     pub compute_unit_limit: Option<u32>,
+    pub detection_delay_ms: Option<i32>,
 }

@@ -285,12 +285,13 @@ mint_blocklist       追加: 同 mint NG リスト
 
 ### 8.0 Carry-over items (各 milestone で defer したもの)
 
-| 出元 | 項目 | 内容 | 引き取り先 |
+| 出元 | 項目 | 内容 | 状態 |
 |---|---|---|---|
-| 4 | **detection delay metric** | chain block_time vs pluto 検知時刻の差。slot-based 近似 (起動時に `getSlot` で reference 取得、`(slot - ref) * 0.4s` で推定) または `getBlockTime` 追加 RPC で取得して `observed_trades.block_time_estimate` 列を追加 | 5 (paper send 実装と同時、latency 関連) |
-| 4 | **latency_samples テーブル** | quote / send / confirm の latency を時系列で蓄積 | 5 (送信パス実装で値が出る) |
-| 4 | **追加 entry filter 条件** (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 7 (Safety Gate と同時) |
-| 4 | **mint_blocklist テーブル** | 2連敗 mint の 24h block | 7 |
+| 4 → 5 | detection delay metric | slot-based 近似 (起動時 `getSlot` で reference、`(slot - ref) * 400ms` で block_time 推定)、`observed_trades.detection_delay_ms` 列 | ✅ done (milestone 5) |
+| 4 → 5 | quote latency | `paper_trades.quote_latency_ms` 列 | ✅ done (milestone 5) |
+| 4 → 8 | send / confirm latency (`latency_samples` テーブル) | 送信パス実装後に時系列 metric として蓄積 | 引き取り先: 8 (Live Send Path) |
+| 4 → 7 | 追加 entry filter 条件 (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 引き取り先: 7 (Safety Gate) |
+| 4 → 7 | mint_blocklist テーブル | 2連敗 mint の 24h block | 引き取り先: 7 |
 
 ### 8.1 Smallest complete loop
 

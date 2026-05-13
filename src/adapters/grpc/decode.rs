@@ -6,6 +6,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::domain::dex_registry;
+use crate::domain::slot_clock;
 use crate::domain::{DexKind, ObservedTrade, Pubkey, Side, Signature, Slot};
 
 pub(super) fn decode(
@@ -31,6 +32,8 @@ pub(super) fn decode(
     let (priority_fee_lamports, compute_unit_limit) =
         extract_compute_budget(&msg.instructions, &accounts);
 
+    let detection_delay_ms = slot_clock::detection_delay_ms(update.slot);
+
     Some(ObservedTrade {
         signature,
         slot,
@@ -46,6 +49,7 @@ pub(super) fn decode(
         jito_marker,
         priority_fee_lamports,
         compute_unit_limit,
+        detection_delay_ms,
     })
 }
 

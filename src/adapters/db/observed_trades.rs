@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -23,8 +23,8 @@ impl<'a> ObservedTrades<'a> {
                 session_id, slot, signature, target, side, mint,
                 sol_delta_lamports, token_delta, route,
                 jupiter, pump_swap, jito_marker,
-                priority_fee_lamports, compute_unit_limit
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                priority_fee_lamports, compute_unit_limit, detection_delay_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id",
         )
         .bind(session_id)
@@ -34,13 +34,14 @@ impl<'a> ObservedTrades<'a> {
         .bind(trade.side.as_str())
         .bind(&mint_bytes)
         .bind(trade.sol_delta_lamports)
-        .bind(trade.token_delta as i64)
+        .bind(i64::try_from(trade.token_delta).context("token_delta exceeds BIGINT")?)
         .bind(&route)
         .bind(trade.jupiter)
         .bind(trade.pump_swap)
         .bind(trade.jito_marker)
-        .bind(trade.priority_fee_lamports as i64)
+        .bind(i64::try_from(trade.priority_fee_lamports).context("priority_fee_lamports exceeds BIGINT")?)
         .bind(trade.compute_unit_limit.map(|c| c as i32))
+        .bind(trade.detection_delay_ms)
         .fetch_one(self.pool)
         .await?;
         Ok(id)
