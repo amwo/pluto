@@ -283,6 +283,15 @@ mint_blocklist       追加: 同 mint NG リスト
 | **9** | Monitoring v2 + Live Readiness | daily report 安定、100 candidates、slippage、route failure、exit 再現性 | 8 |
 | **10** | AWS eu-west-2a deploy | c7i/c7a、SSM secrets、運用ログ、再起動手順 | 9 |
 
+### 8.0 Carry-over items (各 milestone で defer したもの)
+
+| 出元 | 項目 | 内容 | 引き取り先 |
+|---|---|---|---|
+| 4 | **detection delay metric** | chain block_time vs pluto 検知時刻の差。slot-based 近似 (起動時に `getSlot` で reference 取得、`(slot - ref) * 0.4s` で推定) または `getBlockTime` 追加 RPC で取得して `observed_trades.block_time_estimate` 列を追加 | 5 (paper send 実装と同時、latency 関連) |
+| 4 | **latency_samples テーブル** | quote / send / confirm の latency を時系列で蓄積 | 5 (送信パス実装で値が出る) |
+| 4 | **追加 entry filter 条件** (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 7 (Safety Gate と同時) |
+| 4 | **mint_blocklist テーブル** | 2連敗 mint の 24h block | 7 |
+
 ### 8.1 Smallest complete loop
 
 **Milestone 1+2+3** = observe mode で full pipeline (subscribe → decode → filter → DB log) が回って `observed_trades` + `copy_decisions` に観察結果が積まれる状態。Send/Position/Exit はまだ無い。これが **paper 移行可能な最小単位**。

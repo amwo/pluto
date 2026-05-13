@@ -4,7 +4,7 @@ pub mod domain;
 
 mod app;
 
-pub use app::run;
+pub use app::{report, run};
 pub use config::Config;
 
 pub fn init() {

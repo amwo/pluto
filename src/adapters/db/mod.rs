@@ -1,5 +1,6 @@
 pub mod copy_decisions;
 pub mod observed_trades;
+pub mod reports;
 pub mod sessions;
 
 use anyhow::Result;
@@ -26,5 +27,9 @@ impl Db {
 
     pub fn copy_decisions(&self) -> copy_decisions::CopyDecisions<'_> {
         copy_decisions::CopyDecisions::new(&self.pool)
+    }
+
+    pub fn reports(&self) -> reports::Reports<'_> {
+        reports::Reports::new(&self.pool)
     }
 }

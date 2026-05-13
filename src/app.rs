@@ -9,6 +9,13 @@ use crate::domain::{
     decision,
 };
 
+pub async fn report(cfg: Config, day: Option<String>) -> Result<()> {
+    let db = Db::connect(&cfg.database_url).await?;
+    let report = db.reports().daily(day.as_deref()).await?;
+    print!("{report}");
+    Ok(())
+}
+
 pub async fn run(cfg: Config) -> Result<()> {
     let http = Http::new(cfg.http());
     let lamports = http.get_balance(&cfg.bot_wallet).await?;
