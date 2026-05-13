@@ -1,4 +1,4 @@
-mod copy_trading;
+pub mod decision;
 pub mod dex_registry;
 mod mode;
 mod session;
@@ -6,8 +6,7 @@ mod solana;
 mod stream;
 mod trade;
 
-#[allow(unused_imports)]
-pub use copy_trading::*;
+pub use decision::{CopyDecision, FilterParams, SkipReason};
 pub use mode::*;
 pub use session::*;
 pub use solana::*;

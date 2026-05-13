@@ -1,9 +1,13 @@
 use anyhow::Result;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::adapters::{Db, Grpc, Http};
 use crate::config::Config;
-use crate::domain::{Commitment, Session, StreamEvent, Subscription};
+use crate::domain::{
+    Commitment, CopyDecision, FilterParams, ObservedTrade, Session, StreamEvent, Subscription,
+    decision,
+};
 
 pub async fn run(cfg: Config) -> Result<()> {
     let http = Http::new(cfg.http());
@@ -22,23 +26,15 @@ pub async fn run(cfg: Config) -> Result<()> {
         vec![Subscription::WalletTransactions(vec![cfg.target_wallet])],
         Commitment::Processed,
     );
+    let filter = FilterParams::default();
 
     loop {
         tokio::select! {
             msg = events.recv() => match msg {
                 Some(StreamEvent::Trade(trade)) => {
-                    info!(
-                        slot = %trade.slot,
-                        signature = %trade.signature,
-                        side = trade.side.as_str(),
-                        sol = trade.sol_delta_lamports as f64 / 1e9,
-                        route = ?trade.route,
-                        "trade observed"
-                    );
-                    if let Err(e) = db.observed_trades().insert(session.id, &trade).await {
-                        warn!(error = %e, "observed_trades insert failed");
+                    if let Err(e) = handle_trade(&db, session.id, &trade, &filter).await {
+                        warn!(error = %e, "trade handling failed");
                     }
-                    db.sessions().record_tx(session.id).await?;
                 }
                 Some(StreamEvent::Heartbeat) => {
                     info!("heartbeat");
@@ -50,5 +46,42 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     db.sessions().complete(&session).await?;
+    Ok(())
+}
+
+async fn handle_trade(
+    db: &Db,
+    session_id: Uuid,
+    trade: &ObservedTrade,
+    filter: &FilterParams,
+) -> Result<()> {
+    info!(
+        slot = %trade.slot,
+        signature = %trade.signature,
+        side = trade.side.as_str(),
+        sol = trade.sol_delta_lamports as f64 / 1e9,
+        route = ?trade.route,
+        "trade observed"
+    );
+    let trade_id = db.observed_trades().insert(session_id, trade).await?;
+    let dec = decision::decide(trade, filter);
+    match &dec {
+        CopyDecision::Copy { size_lamports } => {
+            info!(
+                signature = %trade.signature,
+                size_sol = *size_lamports as f64 / 1e9,
+                "copy"
+            );
+        }
+        CopyDecision::Skip(reason) => {
+            info!(
+                signature = %trade.signature,
+                reason = reason.as_str(),
+                "skip"
+            );
+        }
+    }
+    db.copy_decisions().insert(session_id, trade_id, &dec).await?;
+    db.sessions().record_tx(session_id).await?;
     Ok(())
 }
