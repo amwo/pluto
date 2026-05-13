@@ -20,8 +20,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let bot_wallet =
-            std::env::var("SOLANA_WALLET_ADDRESS").context("SOLANA_WALLET_ADDRESS")?;
+        let bot_wallet = std::env::var("SOLANA_WALLET_ADDRESS").context("SOLANA_WALLET_ADDRESS")?;
         let target_wallet = std::env::var("TARGET_WALLET").context("TARGET_WALLET")?;
         let mode = std::env::var("PLUTO_MODE").unwrap_or_else(|_| "paper".to_string());
         Ok(Self {
