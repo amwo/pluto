@@ -1,6 +1,7 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -8,9 +9,12 @@ use crate::adapters::db::paper_trades::PaperTradeRecord;
 use crate::adapters::{Db, Grpc, Http, Jupiter, Telegram};
 use crate::config::Config;
 use crate::domain::{
-    Commitment, CopyDecision, ExitReason, FilterParams, ObservedTrade, Position, Pubkey, Quote,
-    Session, Side, SkipReason, StreamEvent, Subscription, decision, slot_clock,
+    Commitment, CopyDecision, ExitParams, ExitReason, FilterParams, ObservedTrade, Position,
+    Pubkey, Quote, Session, Side, SkipReason, StreamEvent, Subscription, decision, exit,
+    slot_clock,
 };
+
+const EXIT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PAPER_SLIPPAGE_BPS: u32 = 200;
@@ -63,6 +67,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         Commitment::Processed,
     );
     let filter = FilterParams::default();
+    let exit_params = ExitParams::default();
+    let mut exit_tick = tokio::time::interval(EXIT_CHECK_INTERVAL);
+    exit_tick.tick().await;
 
     loop {
         tokio::select! {
@@ -77,6 +84,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                     info!("heartbeat");
                 }
                 None => break,
+            },
+            _ = exit_tick.tick() => {
+                if let Err(e) = check_exits(&db, &http, &jupiter, telegram.as_ref(), &cfg.bot_wallet, &wsol, session.id, &exit_params).await {
+                    warn!(error = %e, "exit check failed");
+                }
             },
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -350,7 +362,8 @@ async fn handle_sell(
                 quote.out_amount as i64 - position.entry_in_lamports as i64;
             let realized_pnl_pct =
                 realized_pnl_lamports as f64 / position.entry_in_lamports as f64 * 100.0;
-            db.positions()
+            let closed = db
+                .positions()
                 .close(
                     position.id,
                     pt_id,
@@ -359,6 +372,10 @@ async fn handle_sell(
                     realized_pnl_pct,
                 )
                 .await?;
+            if !closed {
+                info!(position_id = position.id, "close race lost; skipping notify");
+                return Ok(());
+            }
 
             info!(
                 position_id = position.id,
@@ -544,6 +561,168 @@ async fn format_sell_notification(
         "🔗 https://solscan.io/tx/{}\n",
         trade.signature
     ));
+    out.push_str(&format!("(quote latency {quote_latency_ms} ms)"));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_exits(
+    db: &Db,
+    http: &Http,
+    jupiter: &Jupiter,
+    telegram: Option<&Telegram>,
+    bot_wallet: &Pubkey,
+    wsol: &Pubkey,
+    session_id: Uuid,
+    params: &ExitParams,
+) -> Result<()> {
+    let positions = db.positions().list_open(session_id).await?;
+    for position in positions {
+        let started = Instant::now();
+        let quote_result = jupiter
+            .quote(
+                &position.mint,
+                wsol,
+                position.entry_out_amount,
+                PAPER_SLIPPAGE_BPS,
+            )
+            .await;
+        let quote_latency_ms = started.elapsed().as_millis() as i32;
+
+        let quote = match quote_result {
+            Ok(q) => q,
+            Err(e) => {
+                warn!(position_id = position.id, error = %e, "exit price quote failed");
+                continue;
+            }
+        };
+
+        if quote.out_amount == 0 {
+            warn!(
+                position_id = position.id,
+                "exit quote returned zero out_amount; skipping auto close"
+            );
+            continue;
+        }
+
+        let current_price = price_sol_per_raw(quote.out_amount, position.entry_out_amount as u128);
+        if current_price > position.peak_price {
+            db.positions().update_peak(position.id, current_price).await?;
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let Some(reason) = exit::should_exit(&position, current_price, now, params) else {
+            continue;
+        };
+
+        info!(
+            position_id = position.id,
+            reason = reason.as_str(),
+            current_price,
+            entry_price = position.entry_price,
+            peak_price = position.peak_price,
+            "exit triggered"
+        );
+
+        let pt_id = db
+            .paper_trades()
+            .insert(
+                session_id,
+                PaperTradeRecord {
+                    copy_decision_id: None,
+                    input_mint: &position.mint,
+                    output_mint: wsol,
+                    in_amount: position.entry_out_amount,
+                    slippage_bps: PAPER_SLIPPAGE_BPS,
+                    quote: Some(&quote),
+                    quote_latency_ms,
+                    error: None,
+                },
+            )
+            .await?;
+
+        let realized_pnl_lamports = quote.out_amount as i64 - position.entry_in_lamports as i64;
+        let realized_pnl_pct =
+            realized_pnl_lamports as f64 / position.entry_in_lamports as f64 * 100.0;
+
+        let closed = db
+            .positions()
+            .close(position.id, pt_id, reason, realized_pnl_lamports, realized_pnl_pct)
+            .await?;
+        if !closed {
+            info!(position_id = position.id, "close race lost; skipping notify");
+            continue;
+        }
+
+        let msg = format_exit_notification(
+            jupiter,
+            http,
+            bot_wallet,
+            &position,
+            &quote,
+            reason,
+            realized_pnl_lamports,
+            realized_pnl_pct,
+            quote_latency_ms,
+        )
+        .await;
+        notify(telegram, &msg).await;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn format_exit_notification(
+    jupiter: &Jupiter,
+    http: &Http,
+    bot_wallet: &Pubkey,
+    position: &Position,
+    quote: &Quote,
+    reason: ExitReason,
+    realized_pnl_lamports: i64,
+    realized_pnl_pct: f64,
+    quote_latency_ms: i32,
+) -> String {
+    let token = jupiter.token_info(&position.mint).await;
+    let symbol = token
+        .as_ref()
+        .map(|t| t.symbol.clone())
+        .unwrap_or_else(|| short_mint(&position.mint));
+    let decimals = token.as_ref().map(|t| t.decimals).unwrap_or(0);
+
+    let exit_sol = quote.out_amount as f64 / 1e9;
+    let entry_sol = position.entry_in_lamports as f64 / 1e9;
+    let exit_price = price_sol_per_ui_token(quote.out_amount, quote.in_amount as u128, decimals);
+    let entry_price = price_sol_per_ui_token(
+        position.entry_in_lamports,
+        position.entry_out_amount as u128,
+        decimals,
+    );
+    let pnl_sol = realized_pnl_lamports as f64 / 1e9;
+
+    let now = OffsetDateTime::now_utc();
+    let held_secs = (now - position.opened_at).whole_seconds().max(0);
+    let held = format!("{}m{:02}s", held_secs / 60, held_secs % 60);
+
+    let bal_sol = http
+        .get_balance(bot_wallet)
+        .await
+        .ok()
+        .map(|l| l as f64 / 1e9);
+
+    let mut out = String::new();
+    out.push_str(&format!("🔴 SELL {symbol} ({})\n\n", reason.as_str()));
+    out.push_str(&format!(
+        "🤖 Exit:  {exit_sol:.4} SOL{}\n",
+        price_suffix(exit_price)
+    ));
+    out.push_str(&format!(
+        "Entry: {entry_sol:.4} SOL{}\n",
+        price_suffix(entry_price)
+    ));
+    out.push_str(&format!("Held: {held}\n\n"));
+    out.push_str(&format!("💰 PnL: {pnl_sol:+.4} SOL ({realized_pnl_pct:+.1}%)\n"));
+    out.push_str(&format!("🏦 Bal: {}\n", bal_str(bal_sol)));
     out.push_str(&format!("(quote latency {quote_latency_ms} ms)"));
     out
 }

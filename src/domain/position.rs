@@ -13,6 +13,7 @@ pub struct Position {
     pub entry_in_lamports: u64,
     pub entry_out_amount: u64,
     pub entry_price: f64,
+    pub peak_price: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,11 +34,9 @@ impl PositionStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ExitReason {
     TargetSellFollow,
     StopLoss,
-    TakeProfit,
     TrailingStop,
     MaxHold,
     HardMaxHold,
@@ -48,7 +47,6 @@ impl ExitReason {
         match self {
             ExitReason::TargetSellFollow => "target_sell_follow",
             ExitReason::StopLoss => "stop_loss",
-            ExitReason::TakeProfit => "take_profit",
             ExitReason::TrailingStop => "trailing_stop",
             ExitReason::MaxHold => "max_hold",
             ExitReason::HardMaxHold => "hard_max_hold",

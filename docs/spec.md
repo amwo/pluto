@@ -277,7 +277,7 @@ mint_blocklist       追加: 同 mint NG リスト
 | **3** | **Observe 完全ループ** | observe mode で subscribe → decode → filter → DB log が止まらず回る。送信なし | 1, 2 |
 | **4** | Monitoring v1 | 主要 metric (tx, decision, reason, detection delay, skip 集計, 日次 report 最小版) | 3 |
 | **5** | Paper Send Path | Jupiter quote/swap を paper simulate、quote latency / price impact / route failure を記録 | 3, 4 |
-| **6** | Position + Exit Simulation | paper position、target sell follow、SL/TP/trailing/max hold、PnL 集計、**🔴 SELL Telegram 通知 (PnL 付き)** | 5 |
+| **6** | Position + Exit Simulation | paper position、target sell follow、SL/trailing/max hold (TP は spec 5.1 で撤廃)、PnL 集計、**🔴 SELL Telegram 通知 (PnL 付き)** | 5 |
 | **7** | Safety Gate v1 | daily kill switch、risk limit、max exposure、exit > entry priority、stale 検知 | 6 |
 | **8** | Live Send Path | 明示 config 時のみ実 order。Jupiter Swap V2 mode=ultra + jitodontfront + Jito amsterdam → frankfurt → mainnet | 7 |
 | **9** | Monitoring v2 + Live Readiness | daily report 安定、100 candidates、slippage、route failure、exit 再現性 | 8 |
@@ -292,7 +292,9 @@ mint_blocklist       追加: 同 mint NG リスト
 | 4 → 8 | send / confirm latency (`latency_samples` テーブル) | 送信パス実装後に時系列 metric として蓄積 | 引き取り先: 8 (Live Send Path) |
 | 4 → 7 | 追加 entry filter 条件 (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 引き取り先: 7 (Safety Gate) |
 | 4 → 7 | mint_blocklist テーブル | 2連敗 mint の 24h block | 引き取り先: 7 |
-| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して paper exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | ✅ done (milestone 6) |
+| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して paper exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | ✅ done (milestone 6 phase 6a) |
+| 6 | SL / Trailing / MaxHold exit | `domain::exit::should_exit` 純粋関数、30秒 tick で各 open position に Jupiter quote → peak 更新 → 判定、`out_amount=0` ガード | ✅ done (milestone 6 phase 6b) |
+| 6 → 8 | `check_exits` の main loop ブロック解消 | 現在 N open × 2s Jupiter throttle = N×2秒 main loop 占有。`tokio::spawn` で別 task に分離 (live 移行前) | 引き取り先: 8 (Live Send Path / Live readiness) |
 
 ### 8.1 Smallest complete loop
 

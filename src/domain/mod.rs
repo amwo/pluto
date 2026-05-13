@@ -1,5 +1,6 @@
 pub mod decision;
 pub mod dex_registry;
+pub mod exit;
 mod mode;
 mod position;
 mod quote;
@@ -11,6 +12,7 @@ mod stream;
 mod trade;
 
 pub use decision::{CopyDecision, FilterParams, SkipReason};
+pub use exit::*;
 pub use mode::*;
 pub use position::*;
 pub use quote::*;

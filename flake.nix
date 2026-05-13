@@ -47,7 +47,6 @@
               SOLANA_WALLET_ADDRESS = "BGBSb742YrjGLkDXdBL2TKRmeX3ocvueSAp9XmNjqPMe";
               TARGET_WALLET = "2FJiJVTHrLjqnReWVhNmSv5mPwd5a9bUTkJXcpaE7xrb";
               PLUTO_MODE = "observe";
-
               PGHOST = "/data/pluto";
               PGPORT = "5435";
               PGUSER = "pluto";
