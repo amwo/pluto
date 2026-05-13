@@ -12,6 +12,7 @@ pub enum SkipReason {
     DecodeUncertain,
     RateLimited,
     NotABuy,
+    NoOpenPosition,
 }
 
 impl SkipReason {
@@ -27,6 +28,7 @@ impl SkipReason {
             SkipReason::DecodeUncertain => "decode_uncertain",
             SkipReason::RateLimited => "rate_limited",
             SkipReason::NotABuy => "not_a_buy",
+            SkipReason::NoOpenPosition => "no_open_position",
         }
     }
 }

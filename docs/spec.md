@@ -292,7 +292,7 @@ mint_blocklist       追加: 同 mint NG リスト
 | 4 → 8 | send / confirm latency (`latency_samples` テーブル) | 送信パス実装後に時系列 metric として蓄積 | 引き取り先: 8 (Live Send Path) |
 | 4 → 7 | 追加 entry filter 条件 (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 引き取り先: 7 (Safety Gate) |
 | 4 → 7 | mint_blocklist テーブル | 2連敗 mint の 24h block | 引き取り先: 7 |
-| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して paper exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | 引き取り先: 6 (Position + Exit) |
+| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して paper exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | ✅ done (milestone 6) |
 
 ### 8.1 Smallest complete loop
 

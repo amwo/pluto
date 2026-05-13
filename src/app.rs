@@ -8,8 +8,8 @@ use crate::adapters::db::paper_trades::PaperTradeRecord;
 use crate::adapters::{Db, Grpc, Http, Jupiter, Telegram};
 use crate::config::Config;
 use crate::domain::{
-    Commitment, CopyDecision, FilterParams, ObservedTrade, Pubkey, Quote, Session, Side,
-    StreamEvent, Subscription, decision, slot_clock,
+    Commitment, CopyDecision, ExitReason, FilterParams, ObservedTrade, Position, Pubkey, Quote,
+    Session, Side, SkipReason, StreamEvent, Subscription, decision, slot_clock,
 };
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -121,57 +121,86 @@ async fn handle_trade(
         "trade observed"
     );
     let trade_id = db.observed_trades().insert(session_id, trade).await?;
-    let dec = decision::decide(trade, filter);
-    let dec_id = db.copy_decisions().insert(session_id, trade_id, &dec).await?;
 
-    match &dec {
-        CopyDecision::Copy { size_lamports } => {
-            info!(
-                signature = %trade.signature,
-                size_sol = *size_lamports as f64 / 1e9,
-                "copy"
-            );
-            if let Some(mint) = trade.mint {
-                let (input, output) = match trade.side {
-                    Side::Buy => (*wsol, mint),
-                    _ => (mint, *wsol),
-                };
-                paper_quote(
-                    db, http, jupiter, telegram, bot_wallet, session_id, dec_id, trade, &input,
-                    &output, *size_lamports,
+    match trade.side {
+        Side::Buy => {
+            handle_buy(
+                db, http, jupiter, telegram, bot_wallet, wsol, session_id, trade, trade_id, filter,
+            )
+            .await?
+        }
+        Side::Sell => {
+            handle_sell(
+                db, http, jupiter, telegram, bot_wallet, wsol, session_id, trade, trade_id,
+            )
+            .await?
+        }
+        Side::Unknown => {
+            db.copy_decisions()
+                .insert(
+                    session_id,
+                    trade_id,
+                    &CopyDecision::Skip(SkipReason::DecodeUncertain),
                 )
                 .await?;
-            }
-        }
-        CopyDecision::Skip(reason) => {
-            info!(
-                signature = %trade.signature,
-                reason = reason.as_str(),
-                "skip"
-            );
+            info!(signature = %trade.signature, "skip decode_uncertain");
         }
     }
+
     db.sessions().record_tx(session_id).await?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn paper_quote(
+async fn handle_buy(
     db: &Db,
     http: &Http,
     jupiter: &Jupiter,
     telegram: Option<&Telegram>,
     bot_wallet: &Pubkey,
+    wsol: &Pubkey,
     session_id: Uuid,
-    copy_decision_id: i64,
     trade: &ObservedTrade,
-    input_mint: &Pubkey,
-    output_mint: &Pubkey,
-    amount: u64,
+    trade_id: i64,
+    filter: &FilterParams,
 ) -> Result<()> {
+    let Some(mint) = trade.mint else {
+        let skip = CopyDecision::Skip(SkipReason::DecodeUncertain);
+        db.copy_decisions().insert(session_id, trade_id, &skip).await?;
+        info!(signature = %trade.signature, "skip decode_uncertain (no mint)");
+        return Ok(());
+    };
+
+    if db
+        .positions()
+        .find_open_by_mint(session_id, mint)
+        .await?
+        .is_some()
+    {
+        let skip = CopyDecision::Skip(SkipReason::ExistingPosition);
+        db.copy_decisions().insert(session_id, trade_id, &skip).await?;
+        info!(signature = %trade.signature, mint = %mint, "skip existing_position");
+        return Ok(());
+    }
+
+    let dec = decision::decide(trade, filter);
+    let dec_id = db.copy_decisions().insert(session_id, trade_id, &dec).await?;
+
+    let CopyDecision::Copy { size_lamports } = dec else {
+        if let CopyDecision::Skip(reason) = dec {
+            info!(signature = %trade.signature, reason = reason.as_str(), "skip");
+        }
+        return Ok(());
+    };
+    info!(
+        signature = %trade.signature,
+        size_sol = size_lamports as f64 / 1e9,
+        "copy"
+    );
+
     let started = Instant::now();
     let result = jupiter
-        .quote(input_mint, output_mint, amount, PAPER_SLIPPAGE_BPS)
+        .quote(wsol, &mint, size_lamports, PAPER_SLIPPAGE_BPS)
         .await;
     let quote_latency_ms = started.elapsed().as_millis() as i32;
 
@@ -183,16 +212,17 @@ async fn paper_quote(
                 price_impact_bps = quote.price_impact_bps,
                 quote_latency_ms,
                 route = ?quote.route_labels,
-                "paper quote"
+                "paper buy quote"
             );
-            db.paper_trades()
+            let pt_id = db
+                .paper_trades()
                 .insert(
                     session_id,
                     PaperTradeRecord {
-                        copy_decision_id,
-                        input_mint,
-                        output_mint,
-                        in_amount: amount,
+                        copy_decision_id: Some(dec_id),
+                        input_mint: wsol,
+                        output_mint: &mint,
+                        in_amount: size_lamports,
                         slippage_bps: PAPER_SLIPPAGE_BPS,
                         quote: Some(&quote),
                         quote_latency_ms,
@@ -200,23 +230,42 @@ async fn paper_quote(
                     },
                 )
                 .await?;
+
+            let entry_price = price_sol_per_raw(quote.in_amount, quote.out_amount as u128);
+            db.positions()
+                .open(
+                    session_id,
+                    mint,
+                    pt_id,
+                    quote.in_amount,
+                    quote.out_amount,
+                    entry_price,
+                )
+                .await?;
+
             let msg = format_buy_notification(
-                jupiter, http, bot_wallet, trade, &quote, amount, quote_latency_ms,
+                jupiter,
+                http,
+                bot_wallet,
+                trade,
+                &quote,
+                size_lamports,
+                quote_latency_ms,
             )
             .await;
             notify(telegram, &msg).await;
         }
         Err(e) => {
-            warn!(error = %e, quote_latency_ms, "paper quote failed");
+            warn!(error = %e, quote_latency_ms, "paper buy quote failed");
             let msg = e.to_string();
             db.paper_trades()
                 .insert(
                     session_id,
                     PaperTradeRecord {
-                        copy_decision_id,
-                        input_mint,
-                        output_mint,
-                        in_amount: amount,
+                        copy_decision_id: Some(dec_id),
+                        input_mint: wsol,
+                        output_mint: &mint,
+                        in_amount: size_lamports,
                         slippage_bps: PAPER_SLIPPAGE_BPS,
                         quote: None,
                         quote_latency_ms,
@@ -226,7 +275,137 @@ async fn paper_quote(
                 .await?;
             notify(
                 telegram,
-                &format!("⚠️ paper quote failed\n{msg}\nlatency: {quote_latency_ms} ms"),
+                &format!("⚠️ paper buy quote failed\n{msg}\nlatency: {quote_latency_ms} ms"),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_sell(
+    db: &Db,
+    http: &Http,
+    jupiter: &Jupiter,
+    telegram: Option<&Telegram>,
+    bot_wallet: &Pubkey,
+    wsol: &Pubkey,
+    session_id: Uuid,
+    trade: &ObservedTrade,
+    trade_id: i64,
+) -> Result<()> {
+    let mint = match trade.mint {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    let position = db
+        .positions()
+        .find_open_by_mint(session_id, mint)
+        .await?;
+    let Some(position) = position else {
+        db.copy_decisions()
+            .insert(
+                session_id,
+                trade_id,
+                &CopyDecision::Skip(SkipReason::NoOpenPosition),
+            )
+            .await?;
+        info!(signature = %trade.signature, "skip no_open_position");
+        return Ok(());
+    };
+
+    info!(
+        signature = %trade.signature,
+        position_id = position.id,
+        "target sell follow"
+    );
+
+    let started = Instant::now();
+    let result = jupiter
+        .quote(&mint, wsol, position.entry_out_amount, PAPER_SLIPPAGE_BPS)
+        .await;
+    let quote_latency_ms = started.elapsed().as_millis() as i32;
+
+    match result {
+        Ok(quote) => {
+            let pt_id = db
+                .paper_trades()
+                .insert(
+                    session_id,
+                    PaperTradeRecord {
+                        copy_decision_id: None,
+                        input_mint: &mint,
+                        output_mint: wsol,
+                        in_amount: position.entry_out_amount,
+                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        quote: Some(&quote),
+                        quote_latency_ms,
+                        error: None,
+                    },
+                )
+                .await?;
+
+            let realized_pnl_lamports =
+                quote.out_amount as i64 - position.entry_in_lamports as i64;
+            let realized_pnl_pct =
+                realized_pnl_lamports as f64 / position.entry_in_lamports as f64 * 100.0;
+            db.positions()
+                .close(
+                    position.id,
+                    pt_id,
+                    ExitReason::TargetSellFollow,
+                    realized_pnl_lamports,
+                    realized_pnl_pct,
+                )
+                .await?;
+
+            info!(
+                position_id = position.id,
+                exit_paper_trade_id = pt_id,
+                pnl_sol = realized_pnl_lamports as f64 / 1e9,
+                pnl_pct = realized_pnl_pct,
+                "position closed"
+            );
+
+            let msg = format_sell_notification(
+                jupiter,
+                http,
+                bot_wallet,
+                trade,
+                &position,
+                &quote,
+                realized_pnl_lamports,
+                realized_pnl_pct,
+                quote_latency_ms,
+            )
+            .await;
+            notify(telegram, &msg).await;
+        }
+        Err(e) => {
+            warn!(error = %e, quote_latency_ms, "paper sell quote failed");
+            let msg = e.to_string();
+            db.paper_trades()
+                .insert(
+                    session_id,
+                    PaperTradeRecord {
+                        copy_decision_id: None,
+                        input_mint: &mint,
+                        output_mint: wsol,
+                        in_amount: position.entry_out_amount,
+                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        quote: None,
+                        quote_latency_ms,
+                        error: Some(&msg),
+                    },
+                )
+                .await?;
+            notify(
+                telegram,
+                &format!(
+                    "⚠️ paper sell quote failed\nposition: {}\n{msg}\nlatency: {quote_latency_ms} ms",
+                    position.id
+                ),
             )
             .await;
         }
@@ -245,7 +424,7 @@ async fn format_buy_notification(
 ) -> String {
     let mint = match trade.mint {
         Some(m) => m,
-        None => return "💰 paper quote (mint unknown)".to_string(),
+        None => return "💰 paper buy (mint unknown)".to_string(),
     };
     let token = jupiter.token_info(&mint).await;
     let symbol = token
@@ -258,31 +437,23 @@ async fn format_buy_notification(
     let my_sol = my_in_lamports as f64 / 1e9;
     let diff_sol = my_sol - src_sol;
 
-    let src_price = price_sol_per_ui_token(trade.sol_delta_lamports.unsigned_abs(), trade.token_delta.unsigned_abs(), decimals);
+    let src_price = price_sol_per_ui_token(
+        trade.sol_delta_lamports.unsigned_abs(),
+        trade.token_delta.unsigned_abs(),
+        decimals,
+    );
     let my_price = price_sol_per_ui_token(quote.in_amount, quote.out_amount as u128, decimals);
-    let price_diff_pct = match (src_price, my_price) {
-        (Some(s), Some(m)) if s > 0.0 => Some((m - s) / s * 100.0),
-        _ => None,
-    };
+    let price_diff_pct = pct_diff(src_price, my_price);
 
     let bal_sol = http
         .get_balance(bot_wallet)
         .await
         .ok()
         .map(|l| l as f64 / 1e9);
-
-    let icon = match trade.side {
-        Side::Buy => "🟢 BUY",
-        Side::Sell => "🔴 SELL",
-        Side::Unknown => "⚪ TRADE",
-    };
-    let delay = trade
-        .detection_delay_ms
-        .map(|d| d.to_string())
-        .unwrap_or_else(|| "?".to_string());
+    let delay = delay_str(trade.detection_delay_ms);
 
     let mut out = String::new();
-    out.push_str(&format!("{icon} {symbol}\n\n"));
+    out.push_str(&format!("🟢 BUY {symbol}\n\n"));
     out.push_str(&format!(
         "👛 Copy: {:.4} SOL{}\n",
         src_sol,
@@ -300,12 +471,75 @@ async fn format_buy_notification(
             .map(|p| format!("{p:+.2}%"))
             .unwrap_or_else(|| format!("impact {:+.2}%", quote.price_impact_bps as f64 / 100.0)),
     ));
+    out.push_str(&format!("🏦 Bal: {}\n\n", bal_str(bal_sol)));
     out.push_str(&format!(
-        "🏦 Bal: {}\n\n",
-        bal_sol
-            .map(|b| format!("{b:.3} SOL"))
-            .unwrap_or_else(|| "?".to_string())
+        "🔗 https://solscan.io/tx/{}\n",
+        trade.signature
     ));
+    out.push_str(&format!("(quote latency {quote_latency_ms} ms)"));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn format_sell_notification(
+    jupiter: &Jupiter,
+    http: &Http,
+    bot_wallet: &Pubkey,
+    trade: &ObservedTrade,
+    position: &Position,
+    quote: &Quote,
+    realized_pnl_lamports: i64,
+    realized_pnl_pct: f64,
+    quote_latency_ms: i32,
+) -> String {
+    let token = jupiter.token_info(&position.mint).await;
+    let symbol = token
+        .as_ref()
+        .map(|t| t.symbol.clone())
+        .unwrap_or_else(|| short_mint(&position.mint));
+    let decimals = token.as_ref().map(|t| t.decimals).unwrap_or(0);
+
+    let tgt_sol = trade.sol_delta_lamports.unsigned_abs() as f64 / 1e9;
+    let my_sol = quote.out_amount as f64 / 1e9;
+
+    let tgt_price = price_sol_per_ui_token(
+        trade.sol_delta_lamports.unsigned_abs(),
+        trade.token_delta.unsigned_abs(),
+        decimals,
+    );
+    let my_price = price_sol_per_ui_token(quote.out_amount, quote.in_amount as u128, decimals);
+    let price_diff_pct = pct_diff(tgt_price, my_price);
+    let pnl_sol = realized_pnl_lamports as f64 / 1e9;
+
+    let bal_sol = http
+        .get_balance(bot_wallet)
+        .await
+        .ok()
+        .map(|l| l as f64 / 1e9);
+    let delay = delay_str(trade.detection_delay_ms);
+
+    let mut out = String::new();
+    out.push_str(&format!("🔴 SELL {symbol}\n\n"));
+    out.push_str(&format!(
+        "👛 Target: {:.4} SOL{}\n",
+        tgt_sol,
+        price_suffix(tgt_price)
+    ));
+    out.push_str(&format!(
+        "🤖 Mine:   {:.4} SOL{}\n\n",
+        my_sol,
+        price_suffix(my_price)
+    ));
+    out.push_str(&format!(
+        "💰 PnL: {pnl_sol:+.4} SOL ({realized_pnl_pct:+.1}%)\n"
+    ));
+    out.push_str(&format!(
+        "⚖️ Diff: {} | {delay}ms\n",
+        price_diff_pct
+            .map(|p| format!("{p:+.2}% price"))
+            .unwrap_or_else(|| format!("impact {:+.2}%", quote.price_impact_bps as f64 / 100.0)),
+    ));
+    out.push_str(&format!("🏦 Bal: {}\n\n", bal_str(bal_sol)));
     out.push_str(&format!(
         "🔗 https://solscan.io/tx/{}\n",
         trade.signature
@@ -332,6 +566,20 @@ fn price_sol_per_ui_token(sol_lamports: u64, token_raw: u128, decimals: u8) -> O
     Some(sol / ui_tokens)
 }
 
+fn price_sol_per_raw(sol_lamports: u64, token_raw: u128) -> f64 {
+    if token_raw == 0 {
+        return 0.0;
+    }
+    sol_lamports as f64 / token_raw as f64
+}
+
+fn pct_diff(base: Option<f64>, observed: Option<f64>) -> Option<f64> {
+    match (base, observed) {
+        (Some(b), Some(o)) if b > 0.0 => Some((o - b) / b * 100.0),
+        _ => None,
+    }
+}
+
 fn price_suffix(price: Option<f64>) -> String {
     match price {
         Some(p) if p.is_finite() => format!(" @ {p:.9}"),
@@ -339,3 +587,14 @@ fn price_suffix(price: Option<f64>) -> String {
     }
 }
 
+fn delay_str(delay: Option<i32>) -> String {
+    delay
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn bal_str(bal_sol: Option<f64>) -> String {
+    bal_sol
+        .map(|b| format!("{b:.3} SOL"))
+        .unwrap_or_else(|| "?".to_string())
+}

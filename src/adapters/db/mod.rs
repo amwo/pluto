@@ -1,6 +1,7 @@
 pub mod copy_decisions;
 pub mod observed_trades;
 pub mod paper_trades;
+pub mod positions;
 pub mod reports;
 pub mod sessions;
 
@@ -32,6 +33,10 @@ impl Db {
 
     pub fn paper_trades(&self) -> paper_trades::PaperTrades<'_> {
         paper_trades::PaperTrades::new(&self.pool)
+    }
+
+    pub fn positions(&self) -> positions::Positions<'_> {
+        positions::Positions::new(&self.pool)
     }
 
     pub fn reports(&self) -> reports::Reports<'_> {

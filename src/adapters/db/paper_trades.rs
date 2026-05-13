@@ -10,7 +10,7 @@ pub struct PaperTrades<'a> {
 
 #[derive(Clone, Debug)]
 pub struct PaperTradeRecord<'a> {
-    pub copy_decision_id: i64,
+    pub copy_decision_id: Option<i64>,
     pub input_mint: &'a Pubkey,
     pub output_mint: &'a Pubkey,
     pub in_amount: u64,
@@ -25,7 +25,7 @@ impl<'a> PaperTrades<'a> {
         Self { pool }
     }
 
-    pub async fn insert(&self, session_id: Uuid, record: PaperTradeRecord<'_>) -> Result<()> {
+    pub async fn insert(&self, session_id: Uuid, record: PaperTradeRecord<'_>) -> Result<i64> {
         let input_mint = record.input_mint.as_bytes().to_vec();
         let output_mint = record.output_mint.as_bytes().to_vec();
         let in_amount: i64 = i64::try_from(record.in_amount).context("in_amount exceeds BIGINT")?;
@@ -43,13 +43,14 @@ impl<'a> PaperTrades<'a> {
         let price_impact_bps: Option<i32> = record.quote.map(|q| q.price_impact_bps);
         let route_labels: Option<Vec<String>> = record.quote.map(|q| q.route_labels.clone());
 
-        sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             "INSERT INTO paper_trades (
                 session_id, copy_decision_id, input_mint, output_mint,
                 in_amount, out_amount, other_amount_threshold,
                 price_impact_bps, slippage_bps, route_labels,
                 quote_latency_ms, error
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id",
         )
         .bind(session_id)
         .bind(record.copy_decision_id)
@@ -63,8 +64,8 @@ impl<'a> PaperTrades<'a> {
         .bind(&route_labels)
         .bind(record.quote_latency_ms)
         .bind(record.error)
-        .execute(self.pool)
+        .fetch_one(self.pool)
         .await?;
-        Ok(())
+        Ok(id)
     }
 }
