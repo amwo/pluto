@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 
-use crate::adapters::{grpc, http};
+use crate::adapters::{grpc, http, telegram};
 use crate::domain::{Mode, Pubkey};
 
 #[derive(Clone, Debug)]
@@ -15,6 +15,8 @@ pub struct Config {
     pub target_wallet: Pubkey,
     pub mode: Mode,
     pub database_url: String,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
 }
 
 impl Config {
@@ -33,6 +35,8 @@ impl Config {
             target_wallet: Pubkey::from_base58(&target_wallet)?,
             mode: Mode::from_str(&mode).context("PLUTO_MODE")?,
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL")?,
+            telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok(),
+            telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").ok(),
         })
     }
 
@@ -49,6 +53,16 @@ impl Config {
             url: self.rpc_endpoint.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+        }
+    }
+
+    pub fn telegram(&self) -> Option<telegram::Endpoint> {
+        match (&self.telegram_bot_token, &self.telegram_chat_id) {
+            (Some(token), Some(chat_id)) => Some(telegram::Endpoint {
+                token: token.clone(),
+                chat_id: chat_id.clone(),
+            }),
+            _ => None,
         }
     }
 }

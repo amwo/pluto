@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -6,12 +7,19 @@ use tokio::sync::Mutex;
 
 use crate::domain::{Pubkey, Quote};
 
-const BASE_URL: &str = "https://api.jup.ag/swap/v2";
+const API_BASE: &str = "https://api.jup.ag";
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug)]
+pub struct TokenInfo {
+    pub symbol: String,
+    pub decimals: u8,
+}
 
 pub struct Jupiter {
     client: reqwest::Client,
     next_request_at: Mutex<Instant>,
+    token_cache: Mutex<HashMap<[u8; 32], Option<TokenInfo>>>,
 }
 
 impl Default for Jupiter {
@@ -25,6 +33,7 @@ impl Jupiter {
         Self {
             client: reqwest::Client::new(),
             next_request_at: Mutex::new(Instant::now()),
+            token_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -39,7 +48,7 @@ impl Jupiter {
 
         let response: Value = self
             .client
-            .get(format!("{BASE_URL}/order"))
+            .get(format!("{API_BASE}/swap/v2/order"))
             .query(&[
                 ("inputMint", input_mint.to_string()),
                 ("outputMint", output_mint.to_string()),
@@ -63,6 +72,38 @@ impl Jupiter {
             slippage_bps,
             route_labels: parse_route_labels(&response),
         })
+    }
+
+    pub async fn token_info(&self, mint: &Pubkey) -> Option<TokenInfo> {
+        let key = *mint.as_bytes();
+        if let Some(cached) = self.token_cache.lock().await.get(&key) {
+            return cached.clone();
+        }
+        let fetched = self.fetch_token_info(mint).await;
+        self.token_cache.lock().await.insert(key, fetched.clone());
+        fetched
+    }
+
+    async fn fetch_token_info(&self, mint: &Pubkey) -> Option<TokenInfo> {
+        self.throttle().await;
+        let response: Value = self
+            .client
+            .get(format!("{API_BASE}/tokens/v2/search"))
+            .query(&[("query", mint.to_string())])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let needle = mint.to_string();
+        let arr = response.as_array()?;
+        let row = arr.iter().find(|t| t["id"].as_str() == Some(&needle))?;
+        let symbol = row["symbol"].as_str()?.to_string();
+        let decimals = row["decimals"].as_u64()? as u8;
+        Some(TokenInfo { symbol, decimals })
     }
 
     async fn throttle(&self) {
