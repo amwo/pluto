@@ -1,0 +1,12 @@
+## sops creation rules — defines which age recipients can decrypt
+## which secret files. `sops` reads this on every encrypt/decrypt
+## from the repo root.
+
+keys:
+  - &operator_amwo age1qsye0rafr0044464dvp2ks3srr7qcdru7lwz9kn69z4v28mdp5fsqqzd3l
+
+creation_rules:
+  - path_regex: secrets/.*\.yaml$
+    key_groups:
+      - age:
+          - *operator_amwo

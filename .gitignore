@@ -1,0 +1,9 @@
+/target
+/.direnv
+Cargo.lock.bak
+.envrc.local
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
