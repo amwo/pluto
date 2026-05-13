@@ -42,14 +42,15 @@ impl Client {
         commitment: Commitment,
     ) -> Result<RawStream> {
         let request = proto::build_request(subscriptions, commitment);
+        let targets = proto::collect_targets(subscriptions);
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tx.send(request).await?;
         let in_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let response = self.inner.subscribe(in_stream).await?;
         info!(?subscriptions, "subscribed");
-        let mapped = response.into_inner().filter_map(|msg| {
+        let mapped = response.into_inner().filter_map(move |msg| {
             let item = match msg {
-                Ok(update) => proto::map_update(update),
+                Ok(update) => proto::map_update(update, &targets),
                 Err(status) => Some(Err(status.into())),
             };
             std::future::ready(item)

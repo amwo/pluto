@@ -1,3 +1,4 @@
+pub mod observed_trades;
 pub mod sessions;
 
 use anyhow::Result;
@@ -16,5 +17,9 @@ impl Db {
 
     pub fn sessions(&self) -> sessions::Sessions<'_> {
         sessions::Sessions::new(&self.pool)
+    }
+
+    pub fn observed_trades(&self) -> observed_trades::ObservedTrades<'_> {
+        observed_trades::ObservedTrades::new(&self.pool)
     }
 }

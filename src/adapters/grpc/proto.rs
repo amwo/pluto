@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeUpdate,
-    SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+    subscribe_update::UpdateOneof,
 };
 
-use crate::domain::{Commitment, Pubkey, Signature, Slot, StreamEvent, Subscription};
+use super::decode;
+use crate::domain::{Commitment, Pubkey, StreamEvent, Subscription};
 
 pub(super) fn build_request(
     subscriptions: &[Subscription],
@@ -46,20 +47,28 @@ fn commitment_to_proto(c: Commitment) -> i32 {
     }
 }
 
-pub(super) fn map_update(update: SubscribeUpdate) -> Option<Result<StreamEvent>> {
+pub(super) fn collect_targets(subscriptions: &[Subscription]) -> HashSet<Pubkey> {
+    let mut s = HashSet::new();
+    for sub in subscriptions {
+        match sub {
+            Subscription::WalletTransactions(wallets) => {
+                s.extend(wallets.iter().copied());
+            }
+        }
+    }
+    s
+}
+
+pub(super) fn map_update(
+    update: SubscribeUpdate,
+    targets: &HashSet<Pubkey>,
+) -> Option<Result<StreamEvent>> {
     match update.update_oneof {
-        Some(UpdateOneof::Transaction(t)) => Some(decode_tx(t)),
+        Some(UpdateOneof::Transaction(t)) => {
+            let trade = decode::decode(t, targets)?;
+            Some(Ok(StreamEvent::Trade(Box::new(trade))))
+        }
         Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => Some(Ok(StreamEvent::Heartbeat)),
         Some(_) | None => None,
     }
-}
-
-fn decode_tx(t: SubscribeUpdateTransaction) -> Result<StreamEvent> {
-    let slot = Slot::from(t.slot);
-    let bytes = t
-        .transaction
-        .ok_or_else(|| anyhow!("tx update missing transaction body"))?
-        .signature;
-    let signature = Signature::try_from_slice(&bytes)?;
-    Ok(StreamEvent::Tx { slot, signature })
 }

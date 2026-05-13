@@ -1,4 +1,5 @@
-use crate::domain::solana::{Pubkey, Signature, Slot};
+use crate::domain::solana::Pubkey;
+use crate::domain::trade::ObservedTrade;
 
 #[derive(Debug)]
 pub enum Subscription {
@@ -7,6 +8,6 @@ pub enum Subscription {
 
 #[derive(Debug)]
 pub enum StreamEvent {
-    Tx { slot: Slot, signature: Signature },
+    Trade(Box<ObservedTrade>),
     Heartbeat,
 }

@@ -1,4 +1,5 @@
 mod client;
+mod decode;
 mod proto;
 
 use std::time::Duration;

@@ -1,0 +1,47 @@
+use anyhow::Result;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::domain::ObservedTrade;
+
+pub struct ObservedTrades<'a> {
+    pool: &'a PgPool,
+}
+
+impl<'a> ObservedTrades<'a> {
+    pub(super) fn new(pool: &'a PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn insert(&self, session_id: Uuid, trade: &ObservedTrade) -> Result<()> {
+        let route: Vec<String> = trade.route.iter().map(|d| d.as_str().to_string()).collect();
+        let mint_bytes: Option<Vec<u8>> = trade.mint.as_ref().map(|m| m.as_bytes().to_vec());
+        let signature_bytes: Vec<u8> = trade.signature.as_bytes().to_vec();
+        let target_bytes: Vec<u8> = trade.target.as_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO observed_trades (
+                session_id, slot, signature, target, side, mint,
+                sol_delta_lamports, token_delta, route,
+                jupiter, pump_swap, jito_marker,
+                priority_fee_lamports, compute_unit_limit
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(session_id)
+        .bind(trade.slot.as_u64() as i64)
+        .bind(&signature_bytes)
+        .bind(&target_bytes)
+        .bind(trade.side.as_str())
+        .bind(&mint_bytes)
+        .bind(trade.sol_delta_lamports)
+        .bind(trade.token_delta as i64)
+        .bind(&route)
+        .bind(trade.jupiter)
+        .bind(trade.pump_swap)
+        .bind(trade.jito_marker)
+        .bind(trade.priority_fee_lamports as i64)
+        .bind(trade.compute_unit_limit.map(|c| c as i32))
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+}

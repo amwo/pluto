@@ -1,9 +1,9 @@
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::adapters::{Db, Grpc, Http};
 use crate::config::Config;
-use crate::domain::{Commitment, DetectedTx, Session, StreamEvent, Subscription};
+use crate::domain::{Commitment, Session, StreamEvent, Subscription};
 
 pub async fn run(cfg: Config) -> Result<()> {
     let http = Http::new(cfg.http());
@@ -26,9 +26,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     loop {
         tokio::select! {
             msg = events.recv() => match msg {
-                Some(StreamEvent::Tx { slot, signature }) => {
-                    let detected = DetectedTx { slot, signature };
-                    info!(slot = %detected.slot, signature = %detected.signature, "tx");
+                Some(StreamEvent::Trade(trade)) => {
+                    info!(
+                        slot = %trade.slot,
+                        signature = %trade.signature,
+                        side = trade.side.as_str(),
+                        sol = trade.sol_delta_lamports as f64 / 1e9,
+                        route = ?trade.route,
+                        "trade observed"
+                    );
+                    if let Err(e) = db.observed_trades().insert(session.id, &trade).await {
+                        warn!(error = %e, "observed_trades insert failed");
+                    }
                     db.sessions().record_tx(session.id).await?;
                 }
                 Some(StreamEvent::Heartbeat) => {
