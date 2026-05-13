@@ -7,24 +7,24 @@ use tonic::{
     Request, Status,
     metadata::AsciiMetadataValue,
     service::{Interceptor, interceptor::InterceptedService},
-    transport::{Channel, ClientTlsConfig, Endpoint},
+    transport::{Channel, ClientTlsConfig},
 };
 use tracing::info;
 use yellowstone_grpc_proto::prelude::geyser_client::GeyserClient;
 
-use super::GrpcEndpoint;
+use super::Endpoint;
 use super::proto;
 use crate::domain::{Commitment, StreamEvent, Subscription};
 
 type Inner = GeyserClient<InterceptedService<Channel, BasicAuth>>;
 pub(super) type RawStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
-pub(super) struct GrpcClient {
+pub(super) struct Client {
     inner: Inner,
 }
 
-impl GrpcClient {
-    pub(super) async fn connect(endpoint: &GrpcEndpoint) -> Result<Self> {
+impl Client {
+    pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {
         let channel = build_endpoint(&endpoint.url)?
             .connect()
             .await
@@ -75,13 +75,13 @@ impl Interceptor for BasicAuth {
     }
 }
 
-fn build_endpoint(url: &str) -> Result<Endpoint> {
+fn build_endpoint(url: &str) -> Result<tonic::transport::Endpoint> {
     let url = if url.starts_with("http") {
         url.to_string()
     } else {
         format!("https://{url}")
     };
-    let ep = Endpoint::from_shared(url)?
+    let ep = tonic::transport::Endpoint::from_shared(url)?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(20)))

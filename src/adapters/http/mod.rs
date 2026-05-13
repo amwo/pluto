@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use crate::domain::Pubkey;
 
 #[derive(Clone, Debug)]
-pub struct HttpEndpoint {
+pub struct Endpoint {
     pub url: String,
     pub username: String,
     pub password: String,
@@ -12,11 +12,11 @@ pub struct HttpEndpoint {
 
 pub struct Http {
     client: reqwest::Client,
-    endpoint: HttpEndpoint,
+    endpoint: Endpoint,
 }
 
 impl Http {
-    pub fn new(endpoint: HttpEndpoint) -> Self {
+    pub fn new(endpoint: Endpoint) -> Self {
         Self {
             client: reqwest::Client::new(),
             endpoint,

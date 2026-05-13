@@ -8,23 +8,23 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use client::GrpcClient;
+use client::Client;
 
 use crate::domain::{Commitment, StreamEvent, Subscription};
 
 #[derive(Clone, Debug)]
-pub struct GrpcEndpoint {
+pub struct Endpoint {
     pub url: String,
     pub username: String,
     pub password: String,
 }
 
 pub struct Grpc {
-    endpoint: GrpcEndpoint,
+    endpoint: Endpoint,
 }
 
 impl Grpc {
-    pub fn new(endpoint: GrpcEndpoint) -> Self {
+    pub fn new(endpoint: Endpoint) -> Self {
         Self { endpoint }
     }
 
@@ -59,12 +59,12 @@ impl Grpc {
 }
 
 async fn drain(
-    endpoint: &GrpcEndpoint,
+    endpoint: &Endpoint,
     subscriptions: &[Subscription],
     commitment: Commitment,
     tx: &mpsc::Sender<StreamEvent>,
 ) -> Result<()> {
-    let mut client = GrpcClient::connect(endpoint).await?;
+    let mut client = Client::connect(endpoint).await?;
     let mut updates = client.subscribe(subscriptions, commitment).await?;
     while let Some(msg) = updates.next().await {
         let update = msg.context("grpc stream error")?;

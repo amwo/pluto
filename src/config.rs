@@ -2,8 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 
-use crate::adapters::grpc::GrpcEndpoint;
-use crate::adapters::http::HttpEndpoint;
+use crate::adapters::{grpc, http};
 use crate::domain::{Mode, Pubkey};
 
 #[derive(Clone, Debug)]
@@ -37,16 +36,16 @@ impl Config {
         })
     }
 
-    pub fn grpc(&self) -> GrpcEndpoint {
-        GrpcEndpoint {
+    pub fn grpc(&self) -> grpc::Endpoint {
+        grpc::Endpoint {
             url: self.grpc_endpoint.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
         }
     }
 
-    pub fn http(&self) -> HttpEndpoint {
-        HttpEndpoint {
+    pub fn http(&self) -> http::Endpoint {
+        http::Endpoint {
             url: self.rpc_endpoint.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
