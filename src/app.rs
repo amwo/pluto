@@ -552,10 +552,12 @@ async fn handle_buy(
         .observed_trades()
         .target_recent_pnl_lamports(&trade.target, COLD_STREAK_WINDOW_SECS)
         .await?;
+    let wallet_balance_lamports = http.get_balance(bot_wallet).await.unwrap_or(0);
     let ctx = FilterContext {
         open_positions,
         daily_realized_pnl_lamports,
         target_recent_pnl_lamports,
+        wallet_balance_lamports,
     };
     let dec = decision::decide(trade, filter, &ctx);
     let dec_id = db.copy_decisions().insert(session_id, trade_id, &dec).await?;

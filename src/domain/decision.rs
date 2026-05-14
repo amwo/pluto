@@ -12,6 +12,7 @@ pub enum SkipReason {
     DailyLossLimit,
     ExitInProgress,
     HighPriceImpact,
+    InsufficientBalance,
     PriorityFeeAnomaly,
     TargetColdStreak,
     RiskLimit,
@@ -34,6 +35,7 @@ impl SkipReason {
             SkipReason::DailyLossLimit => "daily_loss_limit",
             SkipReason::ExitInProgress => "exit_in_progress",
             SkipReason::HighPriceImpact => "high_price_impact",
+            SkipReason::InsufficientBalance => "insufficient_balance",
             SkipReason::PriorityFeeAnomaly => "priority_fee_anomaly",
             SkipReason::TargetColdStreak => "target_cold_streak",
             SkipReason::RiskLimit => "risk_limit",
@@ -71,20 +73,22 @@ pub struct FilterParams {
     pub max_daily_loss_lamports: u64,
     pub max_priority_fee_lamports: u64,
     pub target_cold_streak_threshold_lamports: i64,
+    pub balance_buffer_lamports: u64,
 }
 
 impl Default for FilterParams {
     fn default() -> Self {
         Self {
-            max_target_buy_lamports: 700_000_000,
+            max_target_buy_lamports: 2_500_000_000,
             min_target_buy_lamports: 50_000_000,
-            copy_ratio_bps: 2500,
-            max_copy_lamports: 150_000_000,
+            copy_ratio_bps: 1000,
+            max_copy_lamports: 200_000_000,
             max_detection_delay_ms: 5_000,
             max_open_positions: 4,
             max_daily_loss_lamports: 900_000_000,
             max_priority_fee_lamports: 5_000_000,
-            target_cold_streak_threshold_lamports: -300_000_000,
+            target_cold_streak_threshold_lamports: i64::MIN,
+            balance_buffer_lamports: 15_000_000,
         }
     }
 }
@@ -94,6 +98,7 @@ pub struct FilterContext {
     pub open_positions: u32,
     pub daily_realized_pnl_lamports: i64,
     pub target_recent_pnl_lamports: i64,
+    pub wallet_balance_lamports: u64,
 }
 
 pub fn decide(
@@ -150,6 +155,12 @@ pub fn decide(
 
     let size_lamports = (target_sol * params.copy_ratio_bps as u64 / 10_000)
         .min(params.max_copy_lamports);
+
+    let required_balance = size_lamports.saturating_add(params.balance_buffer_lamports);
+    if ctx.wallet_balance_lamports < required_balance {
+        return CopyDecision::Skip(SkipReason::InsufficientBalance);
+    }
+
     CopyDecision::Copy { size_lamports }
 }
 
@@ -157,6 +168,15 @@ pub fn decide(
 mod tests {
     use super::*;
     use crate::domain::solana::{Pubkey, Signature, Slot};
+
+    fn rich_ctx() -> FilterContext {
+        FilterContext {
+            open_positions: 0,
+            daily_realized_pnl_lamports: 0,
+            target_recent_pnl_lamports: 0,
+            wallet_balance_lamports: 10_000_000_000,
+        }
+    }
 
     fn buy_trade() -> ObservedTrade {
         ObservedTrade {
@@ -180,7 +200,7 @@ mod tests {
 
     #[test]
     fn copy_when_all_pass() {
-        let dec = decide(&buy_trade(), &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&buy_trade(), &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 
@@ -188,7 +208,7 @@ mod tests {
     fn skip_stale_when_delay_exceeds_limit() {
         let mut t = buy_trade();
         t.detection_delay_ms = Some(5_001);
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::StaleDetection)));
     }
 
@@ -196,7 +216,7 @@ mod tests {
     fn allow_when_delay_unknown() {
         let mut t = buy_trade();
         t.detection_delay_ms = None;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 
@@ -205,7 +225,7 @@ mod tests {
         let dec = decide(
             &buy_trade(),
             &FilterParams::default(),
-            &FilterContext { open_positions: 4, daily_realized_pnl_lamports: 0, target_recent_pnl_lamports: 0 },
+            &FilterContext { open_positions: 4, daily_realized_pnl_lamports: 0, target_recent_pnl_lamports: 0, wallet_balance_lamports: 10_000_000_000 },
         );
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::MaxOpenPositions)));
     }
@@ -215,7 +235,7 @@ mod tests {
         let dec = decide(
             &buy_trade(),
             &FilterParams::default(),
-            &FilterContext { open_positions: 3, daily_realized_pnl_lamports: 0, target_recent_pnl_lamports: 0 },
+            &FilterContext { open_positions: 3, daily_realized_pnl_lamports: 0, target_recent_pnl_lamports: 0, wallet_balance_lamports: 10_000_000_000 },
         );
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
@@ -224,15 +244,15 @@ mod tests {
     fn copy_at_delay_boundary() {
         let mut t = buy_trade();
         t.detection_delay_ms = Some(5_000);
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 
     #[test]
     fn skip_too_large() {
         let mut t = buy_trade();
-        t.sol_delta_lamports = -800_000_000;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        t.sol_delta_lamports = -3_000_000_000;
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::TooLarge)));
     }
 
@@ -240,7 +260,7 @@ mod tests {
     fn skip_too_small() {
         let mut t = buy_trade();
         t.sol_delta_lamports = -10_000_000;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::TooSmall)));
     }
 
@@ -248,7 +268,7 @@ mod tests {
     fn skip_unknown_route() {
         let mut t = buy_trade();
         t.route = vec![DexKind::RaydiumAmmV4];
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::UnknownRoute)));
     }
 
@@ -256,7 +276,7 @@ mod tests {
     fn skip_not_a_buy() {
         let mut t = buy_trade();
         t.side = Side::Sell;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::NotABuy)));
     }
 
@@ -264,39 +284,30 @@ mod tests {
     fn skip_decode_uncertain() {
         let mut t = buy_trade();
         t.side = Side::Unknown;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::DecodeUncertain)));
     }
 
     #[test]
     fn skip_daily_loss_limit_exceeded() {
-        let ctx = FilterContext {
-            open_positions: 0,
-            daily_realized_pnl_lamports: -900_000_001,
-            target_recent_pnl_lamports: 0,
-        };
+        let mut ctx = rich_ctx();
+        ctx.daily_realized_pnl_lamports = -900_000_001;
         let dec = decide(&buy_trade(), &FilterParams::default(), &ctx);
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::DailyLossLimit)));
     }
 
     #[test]
     fn copy_at_daily_loss_boundary() {
-        let ctx = FilterContext {
-            open_positions: 0,
-            daily_realized_pnl_lamports: -899_999_999,
-            target_recent_pnl_lamports: 0,
-        };
+        let mut ctx = rich_ctx();
+        ctx.daily_realized_pnl_lamports = -899_999_999;
         let dec = decide(&buy_trade(), &FilterParams::default(), &ctx);
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 
     #[test]
     fn skip_at_daily_loss_exact_limit() {
-        let ctx = FilterContext {
-            open_positions: 0,
-            daily_realized_pnl_lamports: -900_000_000,
-            target_recent_pnl_lamports: 0,
-        };
+        let mut ctx = rich_ctx();
+        ctx.daily_realized_pnl_lamports = -900_000_000;
         let dec = decide(&buy_trade(), &FilterParams::default(), &ctx);
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::DailyLossLimit)));
     }
@@ -305,7 +316,7 @@ mod tests {
     fn skip_priority_fee_anomaly() {
         let mut t = buy_trade();
         t.priority_fee_lamports = 5_000_001;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::PriorityFeeAnomaly)));
     }
 
@@ -313,29 +324,47 @@ mod tests {
     fn copy_at_priority_fee_boundary() {
         let mut t = buy_trade();
         t.priority_fee_lamports = 5_000_000;
-        let dec = decide(&t, &FilterParams::default(), &FilterContext::default());
+        let dec = decide(&t, &FilterParams::default(), &rich_ctx());
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 
     #[test]
-    fn skip_target_cold_streak() {
-        let ctx = FilterContext {
-            open_positions: 0,
-            daily_realized_pnl_lamports: 0,
-            target_recent_pnl_lamports: -300_000_001,
-        };
+    fn cold_streak_disabled_by_default() {
+        let mut ctx = rich_ctx();
+        ctx.target_recent_pnl_lamports = -1_000_000_000_000;
         let dec = decide(&buy_trade(), &FilterParams::default(), &ctx);
+        assert!(matches!(dec, CopyDecision::Copy { .. }));
+    }
+
+    #[test]
+    fn cold_streak_fires_when_threshold_set() {
+        let params = FilterParams {
+            target_cold_streak_threshold_lamports: -300_000_000,
+            ..FilterParams::default()
+        };
+        let mut ctx = rich_ctx();
+        ctx.target_recent_pnl_lamports = -300_000_001;
+        let dec = decide(&buy_trade(), &params, &ctx);
         assert!(matches!(dec, CopyDecision::Skip(SkipReason::TargetColdStreak)));
     }
 
     #[test]
-    fn copy_at_cold_streak_boundary() {
-        let ctx = FilterContext {
-            open_positions: 0,
-            daily_realized_pnl_lamports: 0,
-            target_recent_pnl_lamports: -300_000_000,
-        };
+    fn skip_insufficient_balance() {
+        let mut ctx = rich_ctx();
+        ctx.wallet_balance_lamports = 1_000_000;
         let dec = decide(&buy_trade(), &FilterParams::default(), &ctx);
+        assert!(matches!(dec, CopyDecision::Skip(SkipReason::InsufficientBalance)));
+    }
+
+    #[test]
+    fn balance_just_enough_passes() {
+        let params = FilterParams::default();
+        let target_sol = 100_000_000u64;
+        let copy_size = target_sol * params.copy_ratio_bps as u64 / 10_000;
+        let required = copy_size + params.balance_buffer_lamports;
+        let mut ctx = rich_ctx();
+        ctx.wallet_balance_lamports = required;
+        let dec = decide(&buy_trade(), &params, &ctx);
         assert!(matches!(dec, CopyDecision::Copy { .. }));
     }
 }
