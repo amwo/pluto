@@ -1,0 +1,28 @@
+[Unit]
+Description=Pluto Solana copy-trading bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=pluto
+Group=pluto
+WorkingDirectory=/opt/pluto
+EnvironmentFile=/opt/pluto/secrets/pluto.env
+ExecStart=/opt/pluto/bin/pluto run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pluto
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

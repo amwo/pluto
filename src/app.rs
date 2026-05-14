@@ -38,6 +38,7 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const DRY_SLIPPAGE_BPS: u32 = 200;
 const MINT_BLOCK_LOSS_THRESHOLD: u32 = 2;
 const MINT_BLOCK_TTL_SECS: i64 = 24 * 60 * 60;
+const COLD_STREAK_WINDOW_SECS: i64 = 60 * 60;
 
 pub async fn report(cfg: Config, day: Option<String>) -> Result<()> {
     let db = Db::connect(&cfg.database_url).await?;
@@ -544,9 +545,14 @@ async fn handle_buy(
             db.positions().realized_pnl_today().await?,
         )
     };
+    let target_recent_pnl_lamports = db
+        .observed_trades()
+        .target_recent_pnl_lamports(&trade.target, COLD_STREAK_WINDOW_SECS)
+        .await?;
     let ctx = FilterContext {
         open_positions,
         daily_realized_pnl_lamports,
+        target_recent_pnl_lamports,
     };
     let dec = decision::decide(trade, filter, &ctx);
     let dec_id = db.copy_decisions().insert(session_id, trade_id, &dec).await?;

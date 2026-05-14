@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::domain::ObservedTrade;
+use crate::domain::{ObservedTrade, Pubkey};
 
 pub struct ObservedTrades<'a> {
     pool: &'a PgPool,
@@ -45,5 +45,23 @@ impl<'a> ObservedTrades<'a> {
         .fetch_one(self.pool)
         .await?;
         Ok(id)
+    }
+
+    pub async fn target_recent_pnl_lamports(
+        &self,
+        target: &Pubkey,
+        window_secs: i64,
+    ) -> Result<i64> {
+        let pnl: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(sol_delta_lamports), 0)::bigint
+             FROM observed_trades
+             WHERE target = $1
+               AND received_at > NOW() - make_interval(secs => $2)",
+        )
+        .bind(target.as_bytes().to_vec())
+        .bind(window_secs as f64)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(pnl)
     }
 }
