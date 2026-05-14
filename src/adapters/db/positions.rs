@@ -103,6 +103,18 @@ impl<'a> Positions<'a> {
         Ok(())
     }
 
+    pub async fn mark_closing_as_crashed(&self) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE positions
+             SET status = 'crashed',
+                 closed_at = NOW()
+             WHERE status = 'closing'",
+        )
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn try_claim_for_close(&self, position_id: i64) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE positions SET status = 'closing'

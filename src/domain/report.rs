@@ -21,6 +21,11 @@ pub struct DailyReport {
     pub positions_closed: i64,
     pub positions_wins: i64,
     pub positions_losses: i64,
+    pub dry_trades_count: i64,
+    pub dry_trades_failed: i64,
+    pub price_impact_p50_bps: Option<i32>,
+    pub price_impact_p95_bps: Option<i32>,
+    pub route_labels_top: Vec<(String, i64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +118,30 @@ impl fmt::Display for DailyReport {
             self.positions_losses,
             self.realized_pnl_lamports as f64 / 1e9,
         )?;
+        let route_failure_rate = if self.dry_trades_count == 0 {
+            0.0
+        } else {
+            100.0 * self.dry_trades_failed as f64 / self.dry_trades_count as f64
+        };
+        writeln!(
+            f,
+            "Dry trades: n={} failed={} ({:.1}%)  price impact: p50={} p95={}",
+            self.dry_trades_count,
+            self.dry_trades_failed,
+            route_failure_rate,
+            self.price_impact_p50_bps
+                .map(|v| format!("{:.2}%", v as f64 / 100.0))
+                .unwrap_or_else(|| "-".to_string()),
+            self.price_impact_p95_bps
+                .map(|v| format!("{:.2}%", v as f64 / 100.0))
+                .unwrap_or_else(|| "-".to_string()),
+        )?;
+        if !self.route_labels_top.is_empty() {
+            writeln!(f, "Top routes:")?;
+            for (label, count) in &self.route_labels_top {
+                writeln!(f, "  {label}: {count}")?;
+            }
+        }
         Ok(())
     }
 }

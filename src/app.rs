@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -6,6 +7,21 @@ use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+struct ExitInFlightGuard(Arc<AtomicU32>);
+
+impl ExitInFlightGuard {
+    fn new(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ExitInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 use crate::adapters::db::dry_trades::DryTradeRecord;
 use crate::adapters::{Db, Grpc, Http, Jito, Jupiter, LiveExecutor, Signer, Telegram};
@@ -50,6 +66,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let db = Arc::new(Db::connect(&cfg.database_url).await?);
     db.sessions().mark_running_as_crashed().await?;
+    let stuck = db.positions().mark_closing_as_crashed().await?;
+    if stuck > 0 {
+        warn!(count = stuck, "marked stuck 'closing' positions as 'crashed' — investigate live tx state on chain");
+    }
 
     let live_executor = build_live_executor(&cfg, http.clone())?;
     let live_executor = live_executor.map(Arc::new);
@@ -85,6 +105,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut exit_tick = tokio::time::interval(EXIT_CHECK_INTERVAL);
     exit_tick.tick().await;
     let exit_gate = Arc::new(Semaphore::new(1));
+    let live_exit_in_flight = Arc::new(AtomicU32::new(0));
 
     loop {
         tokio::select! {
@@ -102,6 +123,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                         session.mode,
                         &trade,
                         &filter,
+                        &live_exit_in_flight,
                     )
                     .await
                     {
@@ -130,6 +152,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let bot_wallet = bot_wallet.clone();
                 let session_id = session.id;
                 let mode = session.mode;
+                let exit_in_flight = live_exit_in_flight.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = check_exits(
@@ -143,6 +166,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                         session_id,
                         mode,
                         &exit_params,
+                        &exit_in_flight,
                     )
                     .await
                     {
@@ -393,6 +417,7 @@ async fn handle_trade(
     mode: Mode,
     trade: &ObservedTrade,
     filter: &FilterParams,
+    live_exit_in_flight: &Arc<AtomicU32>,
 ) -> Result<()> {
     info!(
         slot = %trade.slot,
@@ -408,15 +433,36 @@ async fn handle_trade(
     match trade.side {
         Side::Buy => {
             handle_buy(
-                db, http, jupiter, live, telegram, bot_wallet, wsol, session_id, mode, trade,
-                trade_id, filter,
+                db,
+                http,
+                jupiter,
+                live,
+                telegram,
+                bot_wallet,
+                wsol,
+                session_id,
+                mode,
+                trade,
+                trade_id,
+                filter,
+                live_exit_in_flight,
             )
             .await?
         }
         Side::Sell => {
             handle_sell(
-                db, http, jupiter, live, telegram, bot_wallet, wsol, session_id, mode, trade,
+                db,
+                http,
+                jupiter,
+                live,
+                telegram,
+                bot_wallet,
+                wsol,
+                session_id,
+                mode,
+                trade,
                 trade_id,
+                live_exit_in_flight,
             )
             .await?
         }
@@ -450,6 +496,7 @@ async fn handle_buy(
     trade: &ObservedTrade,
     trade_id: i64,
     filter: &FilterParams,
+    live_exit_in_flight: &Arc<AtomicU32>,
 ) -> Result<()> {
     let Some(mint) = trade.mint else {
         let skip = CopyDecision::Skip(SkipReason::DecodeUncertain);
@@ -479,6 +526,13 @@ async fn handle_buy(
         let skip = CopyDecision::Skip(SkipReason::MintBlocked);
         db.copy_decisions().insert(session_id, trade_id, &skip).await?;
         info!(signature = %trade.signature, mint = %mint, "skip mint_blocked");
+        return Ok(());
+    }
+
+    if mode == Mode::Live && live_exit_in_flight.load(Ordering::SeqCst) > 0 {
+        let skip = CopyDecision::Skip(SkipReason::ExitInProgress);
+        db.copy_decisions().insert(session_id, trade_id, &skip).await?;
+        info!(signature = %trade.signature, "skip exit_in_progress");
         return Ok(());
     }
 
@@ -642,6 +696,7 @@ async fn handle_sell(
     mode: Mode,
     trade: &ObservedTrade,
     trade_id: i64,
+    live_exit_in_flight: &Arc<AtomicU32>,
 ) -> Result<()> {
     if mode == Mode::Observe {
         return Ok(());
@@ -677,6 +732,7 @@ async fn handle_sell(
             warn!("live mode without executor; skipping sell");
             return Ok(());
         };
+        let _guard = ExitInFlightGuard::new(live_exit_in_flight.clone());
         return execute_live_sell(
             db,
             http,
@@ -947,6 +1003,7 @@ async fn check_exits(
     session_id: Uuid,
     mode: Mode,
     params: &ExitParams,
+    live_exit_in_flight: &Arc<AtomicU32>,
 ) -> Result<()> {
     let positions = db.positions().list_open(session_id).await?;
     for position in positions {
@@ -1016,6 +1073,7 @@ async fn check_exits(
                 info!(position_id = position.id, "claim lost; another task is closing");
                 continue;
             }
+            let _guard = ExitInFlightGuard::new(live_exit_in_flight.clone());
             match executor
                 .execute_swap(db, session_id, &position.mint, wsol, position.entry_out_amount)
                 .await

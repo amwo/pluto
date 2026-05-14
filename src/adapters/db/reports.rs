@@ -117,6 +117,34 @@ impl<'a> Reports<'a> {
         .fetch_one(self.pool)
         .await?;
 
+        let dry_row: (i64, i64, Option<i32>, Option<i32>) = sqlx::query_as(
+            "SELECT
+                COUNT(*)::bigint,
+                COUNT(*) FILTER (WHERE error IS NOT NULL)::bigint,
+                percentile_disc(0.5) WITHIN GROUP (ORDER BY price_impact_bps)
+                    FILTER (WHERE error IS NULL),
+                percentile_disc(0.95) WITHIN GROUP (ORDER BY price_impact_bps)
+                    FILTER (WHERE error IS NULL)
+             FROM dry_trades
+             WHERE (fetched_at AT TIME ZONE 'UTC')::date = $1::date",
+        )
+        .bind(&day)
+        .fetch_one(self.pool)
+        .await?;
+
+        let route_labels_top: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT label, COUNT(*)::bigint
+             FROM dry_trades, unnest(route_labels) AS label
+             WHERE (fetched_at AT TIME ZONE 'UTC')::date = $1::date
+               AND route_labels IS NOT NULL
+             GROUP BY label
+             ORDER BY COUNT(*) DESC
+             LIMIT 5",
+        )
+        .bind(&day)
+        .fetch_all(self.pool)
+        .await?;
+
         Ok(DailyReport {
             day,
             total_trades: trade_row.0,
@@ -137,6 +165,11 @@ impl<'a> Reports<'a> {
             positions_closed: positions_row.0,
             positions_wins: positions_row.1,
             positions_losses: positions_row.2,
+            dry_trades_count: dry_row.0,
+            dry_trades_failed: dry_row.1,
+            price_impact_p50_bps: dry_row.2,
+            price_impact_p95_bps: dry_row.3,
+            route_labels_top,
         })
     }
 }
