@@ -5,10 +5,52 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    deploy-rs = {
+      url = "github:serokell/deploy-rs";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    sops-nix = {
+      url = "github:Mic92/sops-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    inputs@{ flake-parts, rust-overlay, ... }:
+    inputs@{
+      self,
+      nixpkgs,
+      flake-parts,
+      rust-overlay,
+      deploy-rs,
+      sops-nix,
+      ...
+    }:
+    let
+      mkPkgs =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+      mkPluto =
+        pkgs:
+        let
+          rust = pkgs.rust-bin.nightly.latest.default;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rust;
+            rustc = rust;
+          };
+        in
+        rustPlatform.buildRustPackage {
+          pname = "pluto";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = with pkgs; [ pkg-config ];
+          buildInputs = with pkgs; [ openssl ];
+          doCheck = false;
+        };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -20,16 +62,17 @@
       perSystem =
         { system, ... }:
         let
-          pkgs = import inputs.nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
+          pkgs = mkPkgs system;
         in
         {
           _module.args.pkgs = pkgs;
 
+          packages.pluto = mkPluto pkgs;
+          packages.default = mkPluto pkgs;
+
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
+              deploy-rs.packages.${system}.default
               gnumake
               jq
               nodejs_24
@@ -37,6 +80,7 @@
               ripgrep
               rust-bin.nightly.latest.default
               sops
+              terraform
             ];
 
             env = {
@@ -72,5 +116,30 @@
             '';
           };
         };
+
+      flake = {
+        nixosModules.pluto = import ./deploy/nixos/module.nix;
+
+        nixosConfigurations.pluto = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          specialArgs = { inherit inputs; };
+          modules = [
+            sops-nix.nixosModules.sops
+            self.nixosModules.pluto
+            ./deploy/nixos/host.nix
+          ];
+        };
+
+        deploy.nodes.pluto = {
+          hostname = "pluto.aws";
+          profiles.system = {
+            user = "root";
+            sshUser = "root";
+            path = deploy-rs.lib.x86_64-linux.activate.nixos self.nixosConfigurations.pluto;
+          };
+        };
+
+        checks = builtins.mapAttrs (_: lib: lib.deployChecks self.deploy) deploy-rs.lib;
+      };
     };
 }

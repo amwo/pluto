@@ -1,0 +1,91 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-pluto
+  cancel-in-progress: false
+
+env:
+  PLUTO_HOST: ${{ vars.PLUTO_HOST }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      system_path: ${{ steps.build.outputs.system_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v17
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/flakehub-cache-action@v2
+
+      - name: Build pluto package + nixos system closure
+        id: build
+        run: |
+          set -euo pipefail
+          nix build --print-build-logs \
+            .#packages.x86_64-linux.pluto \
+            .#nixosConfigurations.pluto.config.system.build.toplevel
+          system=$(nix path-info .#nixosConfigurations.pluto.config.system.build.toplevel)
+          echo "system_path=$system" >> "$GITHUB_OUTPUT"
+          echo "built: $system"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v17
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/flakehub-cache-action@v2
+
+      - name: Setup SSH for deploy-rs
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host pluto
+            HostName ${PLUTO_HOST}
+            User root
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+          EOF
+
+      - name: deploy-rs activate
+        run: |
+          set -euo pipefail
+          nix run --inputs-from . nixpkgs#deploy-rs -- \
+            --skip-checks \
+            --hostname pluto \
+            --magic-rollback \
+            --auto-rollback \
+            .#pluto

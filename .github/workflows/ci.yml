@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v17
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/flakehub-cache-action@v2
+
+      - name: Build pluto
+        run: nix build --print-build-logs .#packages.x86_64-linux.pluto
+
+      - name: Build NixOS system closure
+        run: nix build --print-build-logs .#nixosConfigurations.pluto.config.system.build.toplevel
+
+      - name: Cargo tests (in dev shell)
+        run: nix develop --command cargo test --lib
+
+      - name: Clippy
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
+
+      - name: deploy-rs static checks
+        run: nix flake check --no-build
