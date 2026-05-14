@@ -51,7 +51,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let db = Arc::new(Db::connect(&cfg.database_url).await?);
     db.sessions().mark_running_as_crashed().await?;
 
-    let live_executor = build_live_executor(&cfg)?;
+    let live_executor = build_live_executor(&cfg, http.clone())?;
     let live_executor = live_executor.map(Arc::new);
     if cfg.mode == Mode::Live && live_executor.is_none() {
         anyhow::bail!("PLUTO_MODE=live requires SOLANA_SIGNER_SECRET and JITO_BLOCK_ENGINE_URLS");
@@ -163,7 +163,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn build_live_executor(cfg: &Config) -> Result<Option<LiveExecutor>> {
+fn build_live_executor(cfg: &Config, http: Arc<Http>) -> Result<Option<LiveExecutor>> {
     let Some(secret) = cfg.signer_secret_b58.as_deref() else {
         return Ok(None);
     };
@@ -174,7 +174,7 @@ fn build_live_executor(cfg: &Config) -> Result<Option<LiveExecutor>> {
     let signer = Signer::from_base58_secret(secret)?;
     let jito = Jito::new(endpoints);
     let jupiter = Jupiter::new();
-    Ok(Some(LiveExecutor::new(jupiter, jito, signer)))
+    Ok(Some(LiveExecutor::new(jupiter, jito, signer, http)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +231,7 @@ async fn execute_live_buy(
         quote_latency_ms = outcome.quote_latency_ms,
         swap_latency_ms = outcome.swap_latency_ms,
         send_latency_ms = outcome.send_latency_ms,
+        confirm_latency_ms = ?outcome.confirm_latency_ms,
         "live buy sent"
     );
 

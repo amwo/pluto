@@ -1,18 +1,22 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use uuid::Uuid;
 
+use crate::adapters::http::SignatureStatus;
 use crate::adapters::tx::sign_versioned_tx_b64;
-use crate::adapters::{Db, Jito, Jupiter, Signer};
+use crate::adapters::{Db, Http, Jito, Jupiter, Signer};
 use crate::domain::{LatencyKind, Pubkey, Quote};
 
 const LIVE_SLIPPAGE_BPS: u32 = 200;
+const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct LiveExecutor {
     jupiter: Jupiter,
     jito: Jito,
     signer: Signer,
+    http: std::sync::Arc<Http>,
 }
 
 #[derive(Clone, Debug)]
@@ -23,14 +27,21 @@ pub struct LiveOutcome {
     pub quote_latency_ms: i32,
     pub swap_latency_ms: i32,
     pub send_latency_ms: i32,
+    pub confirm_latency_ms: Option<i32>,
 }
 
 impl LiveExecutor {
-    pub fn new(jupiter: Jupiter, jito: Jito, signer: Signer) -> Self {
+    pub fn new(
+        jupiter: Jupiter,
+        jito: Jito,
+        signer: Signer,
+        http: std::sync::Arc<Http>,
+    ) -> Self {
         Self {
             jupiter,
             jito,
             signer,
+            http,
         }
     }
 
@@ -142,6 +153,10 @@ impl LiveExecutor {
             .await
             .ok();
 
+        let confirm_latency_ms = self
+            .wait_for_confirmation(db, session_id, &outcome.signature)
+            .await;
+
         Ok(LiveOutcome {
             signature: outcome.signature,
             endpoint: outcome.endpoint,
@@ -149,11 +164,69 @@ impl LiveExecutor {
             quote_latency_ms,
             swap_latency_ms,
             send_latency_ms,
+            confirm_latency_ms,
         })
     }
 
     pub fn taker(&self) -> Pubkey {
         self.signer.pubkey()
+    }
+
+    async fn wait_for_confirmation(
+        &self,
+        db: &Db,
+        session_id: Uuid,
+        signature: &str,
+    ) -> Option<i32> {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() >= CONFIRM_TIMEOUT {
+                let elapsed_ms = started.elapsed().as_millis() as i32;
+                db.latency_samples()
+                    .insert(
+                        session_id,
+                        LatencyKind::JitoConfirm,
+                        elapsed_ms,
+                        false,
+                        Some("confirm timeout"),
+                    )
+                    .await
+                    .ok();
+                return None;
+            }
+            match self.http.get_signature_status(signature).await {
+                Ok(SignatureStatus::Failed(err)) => {
+                    let elapsed_ms = started.elapsed().as_millis() as i32;
+                    db.latency_samples()
+                        .insert(
+                            session_id,
+                            LatencyKind::JitoConfirm,
+                            elapsed_ms,
+                            false,
+                            Some(&err),
+                        )
+                        .await
+                        .ok();
+                    return Some(elapsed_ms);
+                }
+                Ok(status) if status.is_landed() => {
+                    let elapsed_ms = started.elapsed().as_millis() as i32;
+                    db.latency_samples()
+                        .insert(
+                            session_id,
+                            LatencyKind::JitoConfirm,
+                            elapsed_ms,
+                            true,
+                            None,
+                        )
+                        .await
+                        .ok();
+                    return Some(elapsed_ms);
+                }
+                _ => {}
+            }
+            tokio::time::sleep(CONFIRM_POLL_INTERVAL).await;
+        }
     }
 }
 
