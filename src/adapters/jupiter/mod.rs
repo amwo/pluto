@@ -11,6 +11,18 @@ const API_BASE: &str = "https://api.jup.ag";
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
+pub struct SwapResponse {
+    pub raw_quote: Value,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuiltSwap {
+    pub tx_b64: String,
+    pub last_valid_block_height: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
 pub struct TokenInfo {
     pub symbol: String,
     pub decimals: u8,
@@ -71,6 +83,54 @@ impl Jupiter {
             price_impact_bps: parse_price_impact_bps(&response)?,
             slippage_bps,
             route_labels: parse_route_labels(&response),
+        })
+    }
+
+    pub async fn quote_raw(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount: u64,
+        slippage_bps: u32,
+        taker: &Pubkey,
+    ) -> Result<SwapResponse> {
+        self.throttle().await;
+
+        let response: Value = self
+            .client
+            .get(format!("{API_BASE}/swap/v2/order"))
+            .query(&[
+                ("inputMint", input_mint.to_string()),
+                ("outputMint", output_mint.to_string()),
+                ("amount", amount.to_string()),
+                ("slippageBps", slippage_bps.to_string()),
+                ("swapMode", "ExactIn".to_string()),
+                ("taker", taker.to_string()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let request_id = response["requestId"].as_str().map(|s| s.to_string());
+        Ok(SwapResponse {
+            raw_quote: response,
+            request_id,
+        })
+    }
+
+    pub async fn build_swap(&self, order: &SwapResponse) -> Result<BuiltSwap> {
+        self.throttle().await;
+        let tx_b64 = order.raw_quote["transaction"]
+            .as_str()
+            .or_else(|| order.raw_quote["swapTransaction"].as_str())
+            .context("swap order missing transaction field")?
+            .to_string();
+        let last_valid_block_height = order.raw_quote["lastValidBlockHeight"].as_u64();
+        Ok(BuiltSwap {
+            tx_b64,
+            last_valid_block_height,
         })
     }
 

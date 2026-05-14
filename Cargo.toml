@@ -23,8 +23,9 @@ thiserror          = "2.0.18"
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
-base64 = "0.22.1"
-bs58   = "0.5"
+base64        = "0.22.1"
+bs58          = "0.5"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 
 mimalloc = { version = "0.1", default-features = false }
 
