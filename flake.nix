@@ -73,6 +73,8 @@
           packages.default = mkPluto pkgs;
 
           devShells.default = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ openssl ];
             packages = with pkgs; [
               deploy-rs.packages.${system}.default
               gnumake
