@@ -341,6 +341,9 @@ async fn execute_live_sell(
     }
 
     update_mint_blocklist(db, position.mint, realized_pnl_lamports).await;
+    if let Err(e) = executor.submit_close_ata(db, session_id, mint).await {
+        warn!(mint = %mint, error = %e, "ATA close failed (rent stays locked)");
+    }
 
     info!(
         signature = %outcome.signature,
@@ -1131,6 +1134,12 @@ async fn check_exits(
         }
 
         update_mint_blocklist(db, position.mint, realized_pnl_lamports).await;
+        if mode == Mode::Live
+            && let Some(executor) = live
+            && let Err(e) = executor.submit_close_ata(db, session_id, &position.mint).await
+        {
+            warn!(mint = %position.mint, error = %e, "ATA close failed (rent stays locked)");
+        }
 
         let mut msg = format_exit_notification(
             jupiter,

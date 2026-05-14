@@ -2224,6 +2224,7 @@ dependencies = [
  "futures-util",
  "mimalloc",
  "prost",
+ "rand 0.8.6",
  "reqwest",
  "serde_json",
  "solana-sdk",

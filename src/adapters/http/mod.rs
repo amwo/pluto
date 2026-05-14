@@ -98,6 +98,28 @@ impl Http {
         })
     }
 
+    pub async fn get_latest_blockhash(&self) -> Result<String> {
+        let response: Value = self
+            .client
+            .post(&self.endpoint.url)
+            .basic_auth(&self.endpoint.username, Some(&self.endpoint.password))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getLatestBlockhash",
+                "params": [{ "commitment": "confirmed" }],
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response["result"]["value"]["blockhash"]
+            .as_str()
+            .context("missing blockhash in response")?
+            .to_string())
+    }
+
     pub async fn get_block_height(&self) -> Result<u64> {
         let response: Value = self
             .client

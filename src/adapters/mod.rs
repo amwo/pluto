@@ -6,7 +6,9 @@ pub mod jito;
 pub mod jupiter;
 pub mod signer;
 pub mod telegram;
+pub mod tip;
 pub mod tx;
+pub mod tx_builder;
 
 pub use db::Db;
 pub use executor::LiveExecutor;

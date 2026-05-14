@@ -5,27 +5,38 @@ use uuid::Uuid;
 
 use crate::adapters::db::live_send_attempts::ClaimResult;
 use crate::adapters::http::SignatureStatus;
+use crate::adapters::tip::TipPolicy;
 use crate::adapters::tx::sign_versioned_tx_b64;
+use crate::adapters::tx_builder::{
+    build_close_ata_tx, build_tip_and_dontfront_tx, derive_ata, signature_b58_from_b64_tx,
+};
 use crate::adapters::{Db, Http, Jito, Jupiter, Signer};
 use crate::domain::{LatencyKind, Pubkey, Quote};
+use solana_sdk::hash::Hash;
+use std::str::FromStr;
 
 const LIVE_SLIPPAGE_BPS: u32 = 200;
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCKHASH_MIN_REMAINING: u64 = 30;
 const FEE_BUFFER_LAMPORTS: u64 = 10_000_000;
+const MIN_TIP_LAMPORTS: u64 = 10_000;
+const FALLBACK_TIP_LAMPORTS: u64 = 100_000;
 
 pub struct LiveExecutor {
     jupiter: Jupiter,
     jito: Jito,
     signer: Signer,
     http: std::sync::Arc<Http>,
+    tip_policy: TipPolicy,
 }
 
 #[derive(Clone, Debug)]
 pub struct LiveOutcome {
     pub signature: String,
+    pub bundle_id: String,
     pub endpoint: String,
+    pub tip_lamports: u64,
     pub quote: Quote,
     pub quote_latency_ms: i32,
     pub swap_latency_ms: i32,
@@ -45,6 +56,7 @@ impl LiveExecutor {
             jito,
             signer,
             http,
+            tip_policy: TipPolicy::new(),
         }
     }
 
@@ -142,6 +154,15 @@ impl LiveExecutor {
 
         let signed = sign_versioned_tx_b64(&built.tx_b64, &self.signer)?;
 
+        let blockhash_str = self.http.get_latest_blockhash().await?;
+        let blockhash = Hash::from_str(&blockhash_str)
+            .map_err(|e| anyhow::anyhow!("parse blockhash: {e}"))?;
+        let tip_lamports = self.compute_tip().await;
+        let tip_account = self.tip_policy.random_tip_account();
+        let tip_tx_b64 =
+            build_tip_and_dontfront_tx(&self.signer, &tip_account, tip_lamports, blockhash)?;
+        let tip_sig_b58 = signature_b58_from_b64_tx(&tip_tx_b64)?;
+
         match db
             .live_send_attempts()
             .try_claim(&signed.signature_b58, session_id)
@@ -155,12 +176,19 @@ impl LiveExecutor {
                 );
             }
         }
+        db.live_send_attempts()
+            .try_claim(&tip_sig_b58, session_id)
+            .await
+            .ok();
 
         let started = Instant::now();
-        let send_result = self.jito.send_bundle_only(&signed.tx_b64).await;
+        let send_result = self
+            .jito
+            .send_bundle(&[signed.tx_b64.clone(), tip_tx_b64])
+            .await;
         let send_latency_ms = started.elapsed().as_millis() as i32;
-        let outcome = match send_result {
-            Ok(o) => o,
+        let bundle = match send_result {
+            Ok(b) => b,
             Err(e) => {
                 db.latency_samples()
                     .insert(
@@ -176,7 +204,7 @@ impl LiveExecutor {
                     .complete(&signed.signature_b58, None, None, false, Some(&e.to_string()))
                     .await
                     .ok();
-                anyhow::bail!("jito send: {e}");
+                anyhow::bail!("jito bundle send: {e}");
             }
         };
         db.latency_samples()
@@ -185,19 +213,19 @@ impl LiveExecutor {
                 LatencyKind::JitoSend,
                 send_latency_ms,
                 true,
-                Some(&outcome.endpoint),
+                Some(&format!("{}#{}", bundle.endpoint, bundle.bundle_id)),
             )
             .await
             .ok();
 
         let confirm_latency_ms = self
-            .wait_for_confirmation(db, session_id, &outcome.signature)
+            .wait_for_confirmation(db, session_id, &signed.signature_b58)
             .await;
         db.live_send_attempts()
             .complete(
-                &outcome.signature,
-                outcome.bundle_id.as_deref(),
-                Some(&outcome.endpoint),
+                &signed.signature_b58,
+                Some(&bundle.bundle_id),
+                Some(&bundle.endpoint),
                 confirm_latency_ms.is_some(),
                 None,
             )
@@ -205,14 +233,64 @@ impl LiveExecutor {
             .ok();
 
         Ok(LiveOutcome {
-            signature: outcome.signature,
-            endpoint: outcome.endpoint,
+            signature: signed.signature_b58,
+            bundle_id: bundle.bundle_id,
+            endpoint: bundle.endpoint,
+            tip_lamports,
             quote,
             quote_latency_ms,
             swap_latency_ms,
             send_latency_ms,
             confirm_latency_ms,
         })
+    }
+
+    async fn compute_tip(&self) -> u64 {
+        match self.tip_policy.current_floor().await {
+            Ok(floor) => floor.p75_lamports.max(MIN_TIP_LAMPORTS),
+            Err(_) => FALLBACK_TIP_LAMPORTS,
+        }
+    }
+
+    pub async fn submit_close_ata(&self, db: &Db, session_id: Uuid, mint: &Pubkey) -> Result<()> {
+        let mint_sdk = solana_sdk::pubkey::Pubkey::from(*mint.as_bytes());
+        let ata = derive_ata(&self.signer.sdk_pubkey(), &mint_sdk);
+        let blockhash_str = self.http.get_latest_blockhash().await?;
+        let blockhash = Hash::from_str(&blockhash_str)
+            .map_err(|e| anyhow::anyhow!("parse blockhash: {e}"))?;
+        let close_tx_b64 = build_close_ata_tx(&self.signer, &ata, blockhash)?;
+        let close_sig_b58 = signature_b58_from_b64_tx(&close_tx_b64)?;
+
+        let tip_lamports = self.compute_tip().await;
+        let tip_account = self.tip_policy.random_tip_account();
+        let tip_tx_b64 =
+            build_tip_and_dontfront_tx(&self.signer, &tip_account, tip_lamports, blockhash)?;
+        let tip_sig_b58 = signature_b58_from_b64_tx(&tip_tx_b64)?;
+
+        db.live_send_attempts()
+            .try_claim(&close_sig_b58, session_id)
+            .await
+            .ok();
+        db.live_send_attempts()
+            .try_claim(&tip_sig_b58, session_id)
+            .await
+            .ok();
+
+        let bundle = self
+            .jito
+            .send_bundle(&[close_tx_b64, tip_tx_b64])
+            .await?;
+        db.live_send_attempts()
+            .complete(
+                &close_sig_b58,
+                Some(&bundle.bundle_id),
+                Some(&bundle.endpoint),
+                true,
+                None,
+            )
+            .await
+            .ok();
+        Ok(())
     }
 
     pub fn taker(&self) -> Pubkey {
