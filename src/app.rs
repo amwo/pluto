@@ -262,9 +262,21 @@ async fn execute_live_sell(
     position: &Position,
     trade: &ObservedTrade,
 ) -> Result<()> {
-    let outcome = executor
+    if !db.positions().try_claim_for_close(position.id).await? {
+        info!(position_id = position.id, "claim lost; another task is closing");
+        return Ok(());
+    }
+
+    let outcome = match executor
         .execute_swap(db, session_id, mint, wsol, position.entry_out_amount)
-        .await?;
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            db.positions().release_claim(position.id).await.ok();
+            return Err(e);
+        }
+    };
     let quote = outcome.quote.clone();
 
     let dt_id = db
@@ -998,12 +1010,17 @@ async fn check_exits(
                 warn!(position_id = position.id, "live mode without executor; aborting exit");
                 continue;
             };
+            if !db.positions().try_claim_for_close(position.id).await? {
+                info!(position_id = position.id, "claim lost; another task is closing");
+                continue;
+            }
             match executor
                 .execute_swap(db, session_id, &position.mint, wsol, position.entry_out_amount)
                 .await
             {
                 Ok(outcome) => (outcome.quote.clone(), Some(outcome.signature)),
                 Err(e) => {
+                    db.positions().release_claim(position.id).await.ok();
                     warn!(position_id = position.id, error = %e, "live exit send failed");
                     continue;
                 }

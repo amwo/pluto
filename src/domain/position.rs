@@ -19,6 +19,7 @@ pub struct Position {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionStatus {
     Open,
+    Closing,
     Closed,
     Crashed,
 }
@@ -27,6 +28,7 @@ impl PositionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             PositionStatus::Open => "open",
+            PositionStatus::Closing => "closing",
             PositionStatus::Closed => "closed",
             PositionStatus::Crashed => "crashed",
         }

@@ -103,6 +103,28 @@ impl<'a> Positions<'a> {
         Ok(())
     }
 
+    pub async fn try_claim_for_close(&self, position_id: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE positions SET status = 'closing'
+             WHERE id = $1 AND status = 'open'",
+        )
+        .bind(position_id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    pub async fn release_claim(&self, position_id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE positions SET status = 'open'
+             WHERE id = $1 AND status = 'closing'",
+        )
+        .bind(position_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn close(
         &self,
         position_id: i64,
@@ -119,7 +141,7 @@ impl<'a> Positions<'a> {
                  exit_dry_trade_id = $3,
                  realized_pnl_lamports = $4,
                  realized_pnl_pct = $5
-             WHERE id = $1 AND status = 'open'",
+             WHERE id = $1 AND status IN ('open', 'closing')",
         )
         .bind(position_id)
         .bind(exit_reason.as_str())
