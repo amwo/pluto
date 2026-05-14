@@ -1,6 +1,8 @@
 pub mod copy_decisions;
+pub mod dry_trades;
+pub mod latency_samples;
+pub mod mint_blocklist;
 pub mod observed_trades;
-pub mod paper_trades;
 pub mod positions;
 pub mod reports;
 pub mod sessions;
@@ -31,12 +33,20 @@ impl Db {
         copy_decisions::CopyDecisions::new(&self.pool)
     }
 
-    pub fn paper_trades(&self) -> paper_trades::PaperTrades<'_> {
-        paper_trades::PaperTrades::new(&self.pool)
+    pub fn dry_trades(&self) -> dry_trades::DryTrades<'_> {
+        dry_trades::DryTrades::new(&self.pool)
     }
 
     pub fn positions(&self) -> positions::Positions<'_> {
         positions::Positions::new(&self.pool)
+    }
+
+    pub fn mint_blocklist(&self) -> mint_blocklist::MintBlocklist<'_> {
+        mint_blocklist::MintBlocklist::new(&self.pool)
+    }
+
+    pub fn latency_samples(&self) -> latency_samples::LatencySamples<'_> {
+        latency_samples::LatencySamples::new(&self.pool)
     }
 
     pub fn reports(&self) -> reports::Reports<'_> {

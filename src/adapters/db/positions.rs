@@ -19,21 +19,21 @@ impl<'a> Positions<'a> {
         &self,
         session_id: Uuid,
         mint: Pubkey,
-        entry_paper_trade_id: i64,
+        entry_dry_trade_id: i64,
         entry_in_lamports: u64,
         entry_out_amount: u64,
         entry_price: f64,
     ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO positions
-                (session_id, mint, entry_paper_trade_id, entry_in_lamports, entry_out_amount,
+                (session_id, mint, entry_dry_trade_id, entry_in_lamports, entry_out_amount,
                  entry_price, peak_price, status)
              VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
              RETURNING id",
         )
         .bind(session_id)
         .bind(mint.as_bytes().to_vec())
-        .bind(entry_paper_trade_id)
+        .bind(entry_dry_trade_id)
         .bind(i64::try_from(entry_in_lamports)?)
         .bind(i64::try_from(entry_out_amount)?)
         .bind(entry_price)
@@ -56,10 +56,33 @@ impl<'a> Positions<'a> {
         row.map(row_to_position).transpose()
     }
 
+    pub async fn count_open(&self, session_id: Uuid) -> Result<u32> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM positions
+             WHERE session_id = $1 AND status = 'open'",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    pub async fn realized_pnl_today(&self) -> Result<i64> {
+        let pnl: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(realized_pnl_lamports), 0)::bigint
+             FROM positions
+             WHERE status = 'closed'
+               AND (closed_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date",
+        )
+        .fetch_one(self.pool)
+        .await?;
+        Ok(pnl)
+    }
+
     pub async fn list_open(&self, session_id: Uuid) -> Result<Vec<Position>> {
         let rows = sqlx::query(
             "SELECT id, session_id, mint, opened_at,
-                    entry_paper_trade_id, entry_in_lamports, entry_out_amount,
+                    entry_dry_trade_id, entry_in_lamports, entry_out_amount,
                     entry_price, peak_price
              FROM positions
              WHERE session_id = $1 AND status = 'open'
@@ -83,7 +106,7 @@ impl<'a> Positions<'a> {
     pub async fn close(
         &self,
         position_id: i64,
-        exit_paper_trade_id: i64,
+        exit_dry_trade_id: i64,
         exit_reason: ExitReason,
         realized_pnl_lamports: i64,
         realized_pnl_pct: f64,
@@ -93,14 +116,14 @@ impl<'a> Positions<'a> {
              SET status = 'closed',
                  closed_at = NOW(),
                  exit_reason = $2,
-                 exit_paper_trade_id = $3,
+                 exit_dry_trade_id = $3,
                  realized_pnl_lamports = $4,
                  realized_pnl_pct = $5
              WHERE id = $1 AND status = 'open'",
         )
         .bind(position_id)
         .bind(exit_reason.as_str())
-        .bind(exit_paper_trade_id)
+        .bind(exit_dry_trade_id)
         .bind(realized_pnl_lamports)
         .bind(realized_pnl_pct)
         .execute(self.pool)
@@ -110,7 +133,7 @@ impl<'a> Positions<'a> {
 }
 
 const SELECT_OPEN_BASE: &str = "SELECT id, session_id, mint, opened_at,
-                    entry_paper_trade_id, entry_in_lamports, entry_out_amount,
+                    entry_dry_trade_id, entry_in_lamports, entry_out_amount,
                     entry_price, peak_price
              FROM positions
              WHERE session_id = $1 AND mint = $2 AND status = 'open'";
@@ -126,7 +149,7 @@ fn row_to_position(r: sqlx::postgres::PgRow) -> Result<Position> {
         session_id: r.try_get("session_id")?,
         mint: Pubkey::from(mint_arr),
         opened_at: r.try_get::<OffsetDateTime, _>("opened_at")?,
-        entry_paper_trade_id: r.try_get("entry_paper_trade_id")?,
+        entry_dry_trade_id: r.try_get("entry_dry_trade_id")?,
         entry_in_lamports: u64::try_from(r.try_get::<i64, _>("entry_in_lamports")?)?,
         entry_out_amount: u64::try_from(r.try_get::<i64, _>("entry_out_amount")?)?,
         entry_price: r.try_get("entry_price")?,

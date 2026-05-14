@@ -28,7 +28,7 @@ Solana 上で短期モメンタム型の勝ち wallet `2FJiJVTHrLjqnReWVhNmSv5mP
 
 - gRPC subscriber (Chainstack Yellowstone, FRA region)
 - Session DB (PostgreSQL, port 5435)
-- Mode 型 (Observe / Paper / Live, default paper)
+- Mode 型 (Observe / Dry / Live, default dry)
 - adapter 層: `Grpc`, `Http`, `Db`
 - domain 層: `Slot`, `Signature`, `Pubkey`, `Commitment`, `DetectedTx`, `StreamEvent`, `Subscription`, `Session`, `Mode`, `SkipReason`
 
@@ -37,8 +37,8 @@ Solana 上で短期モメンタム型の勝ち wallet `2FJiJVTHrLjqnReWVhNmSv5mP
 - **シンプル優先** — 不要な抽象避ける、状態なしは自由関数、状態あり struct
 - **adapter は外部型を漏らさない** — proto/tonic/sqlx/reqwest を main/domain に見せない
 - **domain は依存ゼロに近い** — thiserror のみ
-- **観測 first** — paper/live 評価のため Monitoring を early に
-- **safety は early に薄く、live 直前に厚く** — entry 抑止系は paper でも入れる
+- **観測 first** — dry/live 評価のため Monitoring を early に
+- **safety は early に薄く、live 直前に厚く** — entry 抑止系は dry でも入れる
 
 ## 2. インフラ構成
 
@@ -276,8 +276,8 @@ mint_blocklist       追加: 同 mint NG リスト
 | **2** | Entry Filter + copy_decisions DB | `ObservedTrade` → `CopyDecision { Copy{size} \| Skip(SkipReason) }`、両方 DB に保存 | 1 |
 | **3** | **Observe 完全ループ** | observe mode で subscribe → decode → filter → DB log が止まらず回る。送信なし | 1, 2 |
 | **4** | Monitoring v1 | 主要 metric (tx, decision, reason, detection delay, skip 集計, 日次 report 最小版) | 3 |
-| **5** | Paper Send Path | Jupiter quote/swap を paper simulate、quote latency / price impact / route failure を記録 | 3, 4 |
-| **6** | Position + Exit Simulation | paper position、target sell follow、SL/trailing/max hold (TP は spec 5.1 で撤廃)、PnL 集計、**🔴 SELL Telegram 通知 (PnL 付き)** | 5 |
+| **5** | Dry Send Path | Jupiter quote/swap を dry simulate、quote latency / price impact / route failure を記録 | 3, 4 |
+| **6** | Position + Exit Simulation | dry position、target sell follow、SL/trailing/max hold (TP は spec 5.1 で撤廃)、PnL 集計、**🔴 SELL Telegram 通知 (PnL 付き)** | 5 |
 | **7** | Safety Gate v1 | daily kill switch、risk limit、max exposure、exit > entry priority、stale 検知 | 6 |
 | **8** | Live Send Path | 明示 config 時のみ実 order。Jupiter Swap V2 mode=ultra + jitodontfront + Jito amsterdam → frankfurt → mainnet | 7 |
 | **9** | Monitoring v2 + Live Readiness | daily report 安定、100 candidates、slippage、route failure、exit 再現性 | 8 |
@@ -288,21 +288,35 @@ mint_blocklist       追加: 同 mint NG リスト
 | 出元 | 項目 | 内容 | 状態 |
 |---|---|---|---|
 | 4 → 5 | detection delay metric | slot-based 近似 (起動時 `getSlot` で reference、`(slot - ref) * 400ms` で block_time 推定)、`observed_trades.detection_delay_ms` 列 | ✅ done (milestone 5) |
-| 4 → 5 | quote latency | `paper_trades.quote_latency_ms` 列 | ✅ done (milestone 5) |
+| 4 → 5 | quote latency | `dry_trades.quote_latency_ms` 列 (旧 `paper_trades`, milestone 6 phase 6c で rename) | ✅ done (milestone 5) |
 | 4 → 8 | send / confirm latency (`latency_samples` テーブル) | 送信パス実装後に時系列 metric として蓄積 | 引き取り先: 8 (Live Send Path) |
 | 4 → 7 | 追加 entry filter 条件 (spec 5.3) | cold streak (target_wallet 直近1h PnL)、同 mint loss history、priority fee 異常、mint creation < 30min、target size > P95 | 引き取り先: 7 (Safety Gate) |
 | 4 → 7 | mint_blocklist テーブル | 2連敗 mint の 24h block | 引き取り先: 7 |
-| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して paper exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | ✅ done (milestone 6 phase 6a) |
+| 5 → 6 | 🔴 SELL Telegram 通知 | target SELL に追従して dry exit、PnL/差分/route を含む完全フォーマット (cost basis + realized PnL は position が前提) | ✅ done (milestone 6 phase 6a) |
 | 6 | SL / Trailing / MaxHold exit | `domain::exit::should_exit` 純粋関数、30秒 tick で各 open position に Jupiter quote → peak 更新 → 判定、`out_amount=0` ガード | ✅ done (milestone 6 phase 6b) |
-| 6 → 8 | `check_exits` の main loop ブロック解消 | 現在 N open × 2s Jupiter throttle = N×2秒 main loop 占有。`tokio::spawn` で別 task に分離 (live 移行前) | 引き取り先: 8 (Live Send Path / Live readiness) |
+| 6 → 8 | `check_exits` の main loop ブロック解消 | `Db`/`Http`/`Jupiter`/`Telegram` を `Arc` 化、`exit_tick` 内で `Semaphore::try_acquire_owned` ガードしつつ `tokio::spawn` | ✅ done (milestone 8 phase 8-a) |
+| 4 → 8 | `latency_samples` テーブル | migration 013、`LatencyKind { JupiterQuote, JupiterSwap, JitoSend, JitoConfirm }`、`Db::latency_samples().insert(session, kind, ms, success, detail)`。Jupiter quote 3 callsite + executor の各 step で記録 | ✅ done (milestone 8 phase 8-a) |
+| 7 phase 7a | stale + max_open entry filter | `detection_delay_ms > 5000` で `StaleDetection`、`open_positions >= 4` で `MaxOpenPositions`。`FilterContext` 経由で domain pure 維持。Observe は `open_positions = 0` 固定 | ✅ done (milestone 7 phase 7a) |
+| 7 phase 7b | mint_blocklist | `mint_blocklist` テーブル新設、close 時に `realized_pnl < 0` なら `record_loss`、`>= 0` なら `clear`。`loss_count >= 2` かつ `last_loss_at > NOW() - 24h` で `MintBlocked` skip | ✅ done (milestone 7 phase 7b) |
+| 7 phase 7c | daily kill switch | `positions.realized_pnl_today()` を `FilterContext.daily_realized_pnl_lamports` に詰めて `decide` に渡す。`<= -900_000_000` lamports で `DailyLossLimit` skip。集計範囲は **UTC calendar day** (rolling 24h ではない) | ✅ done (milestone 7 phase 7c) |
+| 7 → 9 | safety-gate DB adapter integration test | `mint_blocklist` UPSERT / `realized_pnl_today` 集計の adapter テスト。本番前に postgres harness で 1 回実行 | 引き取り先: 9 (Live Readiness) |
+| 7 → 9 | blocklist 更新失敗時のアラート | `update_mint_blocklist` のエラーは現在 warn ログのみ。monitoring v2 で metric 化 | 引き取り先: 9 |
+| 8 phase 8-a | Live Send Path skeleton | `adapters/signer` (ed25519-dalek), `adapters/jupiter::{quote_raw, build_swap}` (`/swap/v2/order` w/ taker), `adapters/jito` (`sendTransaction?bundleOnly=true`, amsterdam→frankfurt→mainnet fallback), `adapters/tx::sign_versioned_tx_b64` (shortvec-aware), `adapters/executor::LiveExecutor`。Live mode 起動時に `SOLANA_SIGNER_SECRET` + `JITO_BLOCK_ENGINE_URLS` 必須、欠落で bail。`handle_buy` / `handle_sell` / `check_exits` の close path に live ブランチ追加 (dry path は無変更) | ✅ done (milestone 8 phase 8-a) |
+| 9 phase 9-a | Monitoring v2 daily report 拡張 | `DailyReport` に detection_delay P50/P95、`LatencyStats { kind, samples, success_count, p50, p95 }` リスト、closed positions / wins / losses / realized PnL 追加。`reports.rs` で `percentile_disc(...) WITHIN GROUP` 集計 | ✅ done (milestone 9 phase 9-a) |
+| 8 → 8-b | Jupiter Swap V2 API spec | `/swap/v2/order` レスポンス形 (現在 `transaction` か `swapTransaction` のどちらか) を公式 docs で再確認、必要なら `mode=ultra` フラグや `dynamicComputeUnitLimit` 追加 | 引き取り先: 8 phase 8-b |
+| 8 → 8-b | live exit (`check_exits` LiveExecutor) の優先 send 経路 | spec 8.2 "exit > entry priority" を満たすため、live entry buy より live exit を先送する rate-limit 実装 | 引き取り先: 8 phase 8-b |
+| 8 → 8-b | live tx confirmation latency | `LatencyKind::JitoConfirm` を使って `getSignatureStatuses` で confirm 検証、`latency_samples` に記録 | 引き取り先: 8 phase 8-b |
+| 8 → 8-b [CRITICAL] | live double-sell race | live sell / live auto-exit が `positions.close` の atomic update より前に Jupiter swap を送信。target sell と auto-exit が同時に同 position を見たら両方 tx 送信して二重売却。修正: 送信前に `UPDATE positions SET status='closing' WHERE id=$1 AND status='open' RETURNING ...` で claim、勝ったタスクだけ live send。Codex review 2026-05-13 指摘 | 引き取り先: 8 phase 8-b (live 解放前 必須) |
+| 8 → 8-b [CRITICAL] | Jupiter swap order → Jito 直送の整合性 | 現在 `/swap/v2/order` を Jito `sendTransaction?bundleOnly=true` に直送している。Jupiter Z/RFQ 系の order は managed `/swap/v2/execute` 経由で landing する前提なので、self-managed 送信したいなら `/swap/v2/build` 系または `/swap/v1/swap` (legacy) に切り替える必要あり。Codex review 2026-05-13 指摘 | 引き取り先: 8 phase 8-b (live 解放前 必須) |
+| 8 → 8-b [HIGH] | live exit quote latency 二重取得 | `check_exits` の dry 用判定 quote (price check) と `LiveExecutor.execute_swap` 内部の実送信 quote が別物。現在 `dry_trades.quote_latency_ms` には判定 quote の latency が入る → 実送信 latency と乖離。Codex review 2026-05-13 指摘 | 引き取り先: 8 phase 8-b |
 
 ### 8.1 Smallest complete loop
 
-**Milestone 1+2+3** = observe mode で full pipeline (subscribe → decode → filter → DB log) が回って `observed_trades` + `copy_decisions` に観察結果が積まれる状態。Send/Position/Exit はまだ無い。これが **paper 移行可能な最小単位**。
+**Milestone 1+2+3** = observe mode で full pipeline (subscribe → decode → filter → DB log) が回って `observed_trades` + `copy_decisions` に観察結果が積まれる状態。Send/Position/Exit はまだ無い。これが **dry 移行可能な最小単位**。
 
 ### 8.2 Live 開始条件 (要件書通り)
 
-- paper mode で copy candidate 100 件以上
+- dry mode で copy candidate 100 件以上
 - simulated slippage を測定済み
 - route failure rate が許容範囲
 - target sell 追従 exit が検証済み
@@ -343,7 +357,7 @@ migrations/
 
 | 未決事項 | 推奨判断 |
 |---|---|
-| Jupiter Ultra の認証 / API limit | Ultra 単独 API は deprecated。**Swap V2 `mode=ultra` を Developer tier ($25/月, 10 RPS) で利用**。Free tier (1 RPS) で paper/observe |
+| Jupiter Ultra の認証 / API limit | Ultra 単独 API は deprecated。**Swap V2 `mode=ultra` を Developer tier ($25/月, 10 RPS) で利用**。Free tier (1 RPS) で dry/observe |
 | Live を Swap API か Ultra order flow か | **Swap V2 `/order` (managed)** 採用。`/build` (custom) は CPI 必要時まで不要 |
 | Protected route だけで十分 / Jito direct bundle 必要か | **両方併用**。経路は Jupiter `mode=ultra` (Beam)、送信は自前で Jito `sendTransaction?bundleOnly=true` + jitodontfront。bundle (`/bundles`) は SL/TP atomic か CU 超過時のみ |
 | Role-model wallet 追加 | **MVP は単一 wallet 固定**。第二 wallet は live 安定後に config 配列化で追加 |

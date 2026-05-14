@@ -14,6 +14,22 @@ pub struct DailyReport {
     pub sell_sol_lamports: i64,
     pub jupiter_count: i64,
     pub pump_swap_count: i64,
+    pub detection_delay_p50_ms: Option<i32>,
+    pub detection_delay_p95_ms: Option<i32>,
+    pub latency_breakdown: Vec<LatencyStats>,
+    pub realized_pnl_lamports: i64,
+    pub positions_closed: i64,
+    pub positions_wins: i64,
+    pub positions_losses: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LatencyStats {
+    pub kind: String,
+    pub samples: i64,
+    pub success_count: i64,
+    pub p50_ms: Option<i32>,
+    pub p95_ms: Option<i32>,
 }
 
 impl DailyReport {
@@ -58,6 +74,45 @@ impl fmt::Display for DailyReport {
         for (reason, count) in &self.skip_breakdown {
             writeln!(f, "    {reason}: {count}")?;
         }
+        writeln!(
+            f,
+            "Detection delay: p50={} p95={}",
+            self.detection_delay_p50_ms
+                .map(|v| format!("{v}ms"))
+                .unwrap_or_else(|| "-".to_string()),
+            self.detection_delay_p95_ms
+                .map(|v| format!("{v}ms"))
+                .unwrap_or_else(|| "-".to_string()),
+        )?;
+        writeln!(f, "Latency:")?;
+        for s in &self.latency_breakdown {
+            let success_rate = if s.samples == 0 {
+                0.0
+            } else {
+                100.0 * s.success_count as f64 / s.samples as f64
+            };
+            writeln!(
+                f,
+                "  {}: n={} ok={:.0}% p50={} p95={}",
+                s.kind,
+                s.samples,
+                success_rate,
+                s.p50_ms
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                s.p95_ms
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+            )?;
+        }
+        writeln!(
+            f,
+            "Positions: closed={} (win={} loss={}) realized PnL={:+.4} SOL",
+            self.positions_closed,
+            self.positions_wins,
+            self.positions_losses,
+            self.realized_pnl_lamports as f64 / 1e9,
+        )?;
         Ok(())
     }
 }

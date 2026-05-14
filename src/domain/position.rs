@@ -9,7 +9,7 @@ pub struct Position {
     pub session_id: Uuid,
     pub mint: Pubkey,
     pub opened_at: OffsetDateTime,
-    pub entry_paper_trade_id: i64,
+    pub entry_dry_trade_id: i64,
     pub entry_in_lamports: u64,
     pub entry_out_amount: u64,
     pub entry_price: f64,

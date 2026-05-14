@@ -1,23 +1,27 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::adapters::db::paper_trades::PaperTradeRecord;
-use crate::adapters::{Db, Grpc, Http, Jupiter, Telegram};
+use crate::adapters::db::dry_trades::DryTradeRecord;
+use crate::adapters::{Db, Grpc, Http, Jito, Jupiter, LiveExecutor, Signer, Telegram};
 use crate::config::Config;
 use crate::domain::{
-    Commitment, CopyDecision, ExitParams, ExitReason, FilterParams, ObservedTrade, Position,
-    Pubkey, Quote, Session, Side, SkipReason, StreamEvent, Subscription, decision, exit,
-    slot_clock,
+    Commitment, CopyDecision, ExitParams, ExitReason, FilterContext, FilterParams, LatencyKind,
+    Mode, ObservedTrade, Position, Pubkey, Quote, Session, Side, SkipReason, StreamEvent,
+    Subscription, decision, exit, slot_clock,
 };
 
 const EXIT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const PAPER_SLIPPAGE_BPS: u32 = 200;
+const DRY_SLIPPAGE_BPS: u32 = 200;
+const MINT_BLOCK_LOSS_THRESHOLD: u32 = 2;
+const MINT_BLOCK_TTL_SECS: i64 = 24 * 60 * 60;
 
 pub async fn report(cfg: Config, day: Option<String>) -> Result<()> {
     let db = Db::connect(&cfg.database_url).await?;
@@ -27,12 +31,12 @@ pub async fn report(cfg: Config, day: Option<String>) -> Result<()> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let telegram = cfg.telegram().map(Telegram::new);
+    let telegram = cfg.telegram().map(Telegram::new).map(Arc::new);
     if telegram.is_some() {
         info!("telegram notifications enabled");
     }
 
-    let http = Http::new(cfg.http());
+    let http = Arc::new(Http::new(cfg.http()));
     let lamports = http.get_balance(&cfg.bot_wallet).await?;
     info!(wallet = %cfg.bot_wallet, sol = lamports as f64 / 1e9, "bot wallet balance");
 
@@ -40,18 +44,28 @@ pub async fn run(cfg: Config) -> Result<()> {
     slot_clock::init(current_slot);
     info!(slot = current_slot, "slot clock initialized");
 
-    let jupiter = Jupiter::new();
+    let jupiter = Arc::new(Jupiter::new());
     let wsol = Pubkey::from_base58(WSOL_MINT)?;
+    let bot_wallet = Arc::new(cfg.bot_wallet);
 
-    let db = Db::connect(&cfg.database_url).await?;
+    let db = Arc::new(Db::connect(&cfg.database_url).await?);
     db.sessions().mark_running_as_crashed().await?;
+
+    let live_executor = build_live_executor(&cfg)?;
+    let live_executor = live_executor.map(Arc::new);
+    if cfg.mode == Mode::Live && live_executor.is_none() {
+        anyhow::bail!("PLUTO_MODE=live requires SOLANA_SIGNER_SECRET and JITO_BLOCK_ENGINE_URLS");
+    }
+    if let Some(exec) = &live_executor {
+        info!(taker = %exec.taker(), "live executor ready");
+    }
 
     let session = Session::new(cfg.mode);
     db.sessions().insert(&session).await?;
     info!(id = %session.id, mode = session.mode.as_str(), "session started");
 
     notify(
-        telegram.as_ref(),
+        telegram.as_deref(),
         &format!(
             "🟢 pluto started\nsession: {}\nmode: {}\nbalance: {:.3} SOL",
             session.id,
@@ -70,14 +84,29 @@ pub async fn run(cfg: Config) -> Result<()> {
     let exit_params = ExitParams::default();
     let mut exit_tick = tokio::time::interval(EXIT_CHECK_INTERVAL);
     exit_tick.tick().await;
+    let exit_gate = Arc::new(Semaphore::new(1));
 
     loop {
         tokio::select! {
             msg = events.recv() => match msg {
                 Some(StreamEvent::Trade(trade)) => {
-                    if let Err(e) = handle_trade(&db, &http, &jupiter, telegram.as_ref(), &cfg.bot_wallet, &wsol, session.id, &trade, &filter).await {
+                    if let Err(e) = handle_trade(
+                        &db,
+                        &http,
+                        &jupiter,
+                        live_executor.as_deref(),
+                        telegram.as_deref(),
+                        &bot_wallet,
+                        &wsol,
+                        session.id,
+                        session.mode,
+                        &trade,
+                        &filter,
+                    )
+                    .await
+                    {
                         warn!(error = %e, "trade handling failed");
-                        notify(telegram.as_ref(), &format!("⚠️ trade handling failed\n{e}")).await;
+                        notify(telegram.as_deref(), &format!("⚠️ trade handling failed\n{e}")).await;
                     }
                 }
                 Some(StreamEvent::Heartbeat) => {
@@ -86,9 +115,40 @@ pub async fn run(cfg: Config) -> Result<()> {
                 None => break,
             },
             _ = exit_tick.tick() => {
-                if let Err(e) = check_exits(&db, &http, &jupiter, telegram.as_ref(), &cfg.bot_wallet, &wsol, session.id, &exit_params).await {
-                    warn!(error = %e, "exit check failed");
+                if session.mode == Mode::Observe {
+                    continue;
                 }
+                let Ok(permit) = exit_gate.clone().try_acquire_owned() else {
+                    info!("exit check still running, skipping tick");
+                    continue;
+                };
+                let db = db.clone();
+                let http = http.clone();
+                let jupiter = jupiter.clone();
+                let live = live_executor.clone();
+                let telegram = telegram.clone();
+                let bot_wallet = bot_wallet.clone();
+                let session_id = session.id;
+                let mode = session.mode;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = check_exits(
+                        &db,
+                        &http,
+                        &jupiter,
+                        live.as_deref(),
+                        telegram.as_deref(),
+                        &bot_wallet,
+                        &wsol,
+                        session_id,
+                        mode,
+                        &exit_params,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "exit check failed");
+                    }
+                });
             },
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -96,10 +156,176 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     db.sessions().complete(&session).await?;
     notify(
-        telegram.as_ref(),
+        telegram.as_deref(),
         &format!("🔴 pluto stopped\nsession: {}", session.id),
     )
     .await;
+    Ok(())
+}
+
+fn build_live_executor(cfg: &Config) -> Result<Option<LiveExecutor>> {
+    let Some(secret) = cfg.signer_secret_b58.as_deref() else {
+        return Ok(None);
+    };
+    let endpoints = cfg.jito();
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    let signer = Signer::from_base58_secret(secret)?;
+    let jito = Jito::new(endpoints);
+    let jupiter = Jupiter::new();
+    Ok(Some(LiveExecutor::new(jupiter, jito, signer)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_live_buy(
+    db: &Db,
+    http: &Http,
+    executor: &LiveExecutor,
+    telegram: Option<&Telegram>,
+    bot_wallet: &Pubkey,
+    wsol: &Pubkey,
+    mint: &Pubkey,
+    session_id: Uuid,
+    dec_id: i64,
+    size_lamports: u64,
+    trade: &ObservedTrade,
+) -> Result<()> {
+    let outcome = executor
+        .execute_swap(db, session_id, wsol, mint, size_lamports)
+        .await?;
+    let quote = outcome.quote.clone();
+
+    let dt_id = db
+        .dry_trades()
+        .insert(
+            session_id,
+            DryTradeRecord {
+                copy_decision_id: Some(dec_id),
+                input_mint: wsol,
+                output_mint: mint,
+                in_amount: size_lamports,
+                slippage_bps: quote.slippage_bps,
+                quote: Some(&quote),
+                quote_latency_ms: outcome.quote_latency_ms,
+                error: None,
+            },
+        )
+        .await?;
+
+    let entry_price = price_sol_per_raw(quote.in_amount, quote.out_amount as u128);
+    db.positions()
+        .open(
+            session_id,
+            *mint,
+            dt_id,
+            quote.in_amount,
+            quote.out_amount,
+            entry_price,
+        )
+        .await?;
+
+    info!(
+        signature = %outcome.signature,
+        endpoint = %outcome.endpoint,
+        quote_latency_ms = outcome.quote_latency_ms,
+        swap_latency_ms = outcome.swap_latency_ms,
+        send_latency_ms = outcome.send_latency_ms,
+        "live buy sent"
+    );
+
+    let mut msg = format_buy_notification(
+        &Jupiter::new(),
+        http,
+        bot_wallet,
+        trade,
+        &quote,
+        size_lamports,
+        outcome.quote_latency_ms,
+    )
+    .await;
+    msg.push_str(&format!("\n🚀 live tx: https://solscan.io/tx/{}", outcome.signature));
+    notify(telegram, &msg).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_live_sell(
+    db: &Db,
+    http: &Http,
+    executor: &LiveExecutor,
+    telegram: Option<&Telegram>,
+    bot_wallet: &Pubkey,
+    wsol: &Pubkey,
+    mint: &Pubkey,
+    session_id: Uuid,
+    position: &Position,
+    trade: &ObservedTrade,
+) -> Result<()> {
+    let outcome = executor
+        .execute_swap(db, session_id, mint, wsol, position.entry_out_amount)
+        .await?;
+    let quote = outcome.quote.clone();
+
+    let dt_id = db
+        .dry_trades()
+        .insert(
+            session_id,
+            DryTradeRecord {
+                copy_decision_id: None,
+                input_mint: mint,
+                output_mint: wsol,
+                in_amount: position.entry_out_amount,
+                slippage_bps: quote.slippage_bps,
+                quote: Some(&quote),
+                quote_latency_ms: outcome.quote_latency_ms,
+                error: None,
+            },
+        )
+        .await?;
+
+    let realized_pnl_lamports = quote.out_amount as i64 - position.entry_in_lamports as i64;
+    let realized_pnl_pct =
+        realized_pnl_lamports as f64 / position.entry_in_lamports as f64 * 100.0;
+    let closed = db
+        .positions()
+        .close(
+            position.id,
+            dt_id,
+            ExitReason::TargetSellFollow,
+            realized_pnl_lamports,
+            realized_pnl_pct,
+        )
+        .await?;
+    if !closed {
+        info!(position_id = position.id, "close race lost; skipping notify");
+        return Ok(());
+    }
+
+    update_mint_blocklist(db, position.mint, realized_pnl_lamports).await;
+
+    info!(
+        signature = %outcome.signature,
+        endpoint = %outcome.endpoint,
+        position_id = position.id,
+        pnl_sol = realized_pnl_lamports as f64 / 1e9,
+        "live sell sent"
+    );
+
+    let mut msg = format_sell_notification(
+        &Jupiter::new(),
+        http,
+        bot_wallet,
+        trade,
+        position,
+        &quote,
+        realized_pnl_lamports,
+        realized_pnl_pct,
+        outcome.quote_latency_ms,
+    )
+    .await;
+    msg.push_str(&format!("\n🚀 live tx: https://solscan.io/tx/{}", outcome.signature));
+    notify(telegram, &msg).await;
     Ok(())
 }
 
@@ -111,15 +337,47 @@ async fn notify(tg: Option<&Telegram>, text: &str) {
     }
 }
 
+async fn record_latency(
+    db: &Db,
+    session_id: Uuid,
+    kind: LatencyKind,
+    elapsed_ms: i32,
+    success: bool,
+    detail: Option<&str>,
+) {
+    if let Err(e) = db
+        .latency_samples()
+        .insert(session_id, kind, elapsed_ms, success, detail)
+        .await
+    {
+        warn!(error = %e, kind = kind.as_str(), "latency sample insert failed");
+    }
+}
+
+async fn update_mint_blocklist(db: &Db, mint: Pubkey, realized_pnl_lamports: i64) {
+    let result = if realized_pnl_lamports < 0 {
+        db.mint_blocklist().record_loss(mint).await.map(Some)
+    } else {
+        db.mint_blocklist().clear(mint).await.map(|_| None)
+    };
+    match result {
+        Ok(Some(count)) => info!(mint = %mint, loss_count = count, "mint loss recorded"),
+        Ok(None) => {}
+        Err(e) => warn!(mint = %mint, error = %e, "mint blocklist update failed"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_trade(
     db: &Db,
     http: &Http,
     jupiter: &Jupiter,
+    live: Option<&LiveExecutor>,
     telegram: Option<&Telegram>,
     bot_wallet: &Pubkey,
     wsol: &Pubkey,
     session_id: Uuid,
+    mode: Mode,
     trade: &ObservedTrade,
     filter: &FilterParams,
 ) -> Result<()> {
@@ -137,13 +395,15 @@ async fn handle_trade(
     match trade.side {
         Side::Buy => {
             handle_buy(
-                db, http, jupiter, telegram, bot_wallet, wsol, session_id, trade, trade_id, filter,
+                db, http, jupiter, live, telegram, bot_wallet, wsol, session_id, mode, trade,
+                trade_id, filter,
             )
             .await?
         }
         Side::Sell => {
             handle_sell(
-                db, http, jupiter, telegram, bot_wallet, wsol, session_id, trade, trade_id,
+                db, http, jupiter, live, telegram, bot_wallet, wsol, session_id, mode, trade,
+                trade_id,
             )
             .await?
         }
@@ -168,10 +428,12 @@ async fn handle_buy(
     db: &Db,
     http: &Http,
     jupiter: &Jupiter,
+    live: Option<&LiveExecutor>,
     telegram: Option<&Telegram>,
     bot_wallet: &Pubkey,
     wsol: &Pubkey,
     session_id: Uuid,
+    mode: Mode,
     trade: &ObservedTrade,
     trade_id: i64,
     filter: &FilterParams,
@@ -183,11 +445,12 @@ async fn handle_buy(
         return Ok(());
     };
 
-    if db
-        .positions()
-        .find_open_by_mint(session_id, mint)
-        .await?
-        .is_some()
+    if mode != Mode::Observe
+        && db
+            .positions()
+            .find_open_by_mint(session_id, mint)
+            .await?
+            .is_some()
     {
         let skip = CopyDecision::Skip(SkipReason::ExistingPosition);
         db.copy_decisions().insert(session_id, trade_id, &skip).await?;
@@ -195,7 +458,30 @@ async fn handle_buy(
         return Ok(());
     }
 
-    let dec = decision::decide(trade, filter);
+    if db
+        .mint_blocklist()
+        .is_blocked(mint, MINT_BLOCK_LOSS_THRESHOLD, MINT_BLOCK_TTL_SECS)
+        .await?
+    {
+        let skip = CopyDecision::Skip(SkipReason::MintBlocked);
+        db.copy_decisions().insert(session_id, trade_id, &skip).await?;
+        info!(signature = %trade.signature, mint = %mint, "skip mint_blocked");
+        return Ok(());
+    }
+
+    let (open_positions, daily_realized_pnl_lamports) = if mode == Mode::Observe {
+        (0, 0)
+    } else {
+        (
+            db.positions().count_open(session_id).await?,
+            db.positions().realized_pnl_today().await?,
+        )
+    };
+    let ctx = FilterContext {
+        open_positions,
+        daily_realized_pnl_lamports,
+    };
+    let dec = decision::decide(trade, filter, &ctx);
     let dec_id = db.copy_decisions().insert(session_id, trade_id, &dec).await?;
 
     let CopyDecision::Copy { size_lamports } = dec else {
@@ -207,14 +493,49 @@ async fn handle_buy(
     info!(
         signature = %trade.signature,
         size_sol = size_lamports as f64 / 1e9,
+        mode = mode.as_str(),
         "copy"
     );
 
+    if mode == Mode::Observe {
+        return Ok(());
+    }
+
+    if mode == Mode::Live {
+        let Some(executor) = live else {
+            warn!("live mode without executor; skipping buy");
+            return Ok(());
+        };
+        return execute_live_buy(
+            db,
+            http,
+            executor,
+            telegram,
+            bot_wallet,
+            wsol,
+            &mint,
+            session_id,
+            dec_id,
+            size_lamports,
+            trade,
+        )
+        .await;
+    }
+
     let started = Instant::now();
     let result = jupiter
-        .quote(wsol, &mint, size_lamports, PAPER_SLIPPAGE_BPS)
+        .quote(wsol, &mint, size_lamports, DRY_SLIPPAGE_BPS)
         .await;
     let quote_latency_ms = started.elapsed().as_millis() as i32;
+    record_latency(
+        db,
+        session_id,
+        LatencyKind::JupiterQuote,
+        quote_latency_ms,
+        result.is_ok(),
+        result.as_ref().err().map(|e| e.to_string()).as_deref(),
+    )
+    .await;
 
     match result {
         Ok(quote) => {
@@ -224,18 +545,18 @@ async fn handle_buy(
                 price_impact_bps = quote.price_impact_bps,
                 quote_latency_ms,
                 route = ?quote.route_labels,
-                "paper buy quote"
+                "dry buy quote"
             );
-            let pt_id = db
-                .paper_trades()
+            let dt_id = db
+                .dry_trades()
                 .insert(
                     session_id,
-                    PaperTradeRecord {
+                    DryTradeRecord {
                         copy_decision_id: Some(dec_id),
                         input_mint: wsol,
                         output_mint: &mint,
                         in_amount: size_lamports,
-                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        slippage_bps: DRY_SLIPPAGE_BPS,
                         quote: Some(&quote),
                         quote_latency_ms,
                         error: None,
@@ -248,7 +569,7 @@ async fn handle_buy(
                 .open(
                     session_id,
                     mint,
-                    pt_id,
+                    dt_id,
                     quote.in_amount,
                     quote.out_amount,
                     entry_price,
@@ -268,17 +589,17 @@ async fn handle_buy(
             notify(telegram, &msg).await;
         }
         Err(e) => {
-            warn!(error = %e, quote_latency_ms, "paper buy quote failed");
+            warn!(error = %e, quote_latency_ms, "dry buy quote failed");
             let msg = e.to_string();
-            db.paper_trades()
+            db.dry_trades()
                 .insert(
                     session_id,
-                    PaperTradeRecord {
+                    DryTradeRecord {
                         copy_decision_id: Some(dec_id),
                         input_mint: wsol,
                         output_mint: &mint,
                         in_amount: size_lamports,
-                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        slippage_bps: DRY_SLIPPAGE_BPS,
                         quote: None,
                         quote_latency_ms,
                         error: Some(&msg),
@@ -287,7 +608,7 @@ async fn handle_buy(
                 .await?;
             notify(
                 telegram,
-                &format!("⚠️ paper buy quote failed\n{msg}\nlatency: {quote_latency_ms} ms"),
+                &format!("⚠️ dry buy quote failed\n{msg}\nlatency: {quote_latency_ms} ms"),
             )
             .await;
         }
@@ -300,13 +621,18 @@ async fn handle_sell(
     db: &Db,
     http: &Http,
     jupiter: &Jupiter,
+    live: Option<&LiveExecutor>,
     telegram: Option<&Telegram>,
     bot_wallet: &Pubkey,
     wsol: &Pubkey,
     session_id: Uuid,
+    mode: Mode,
     trade: &ObservedTrade,
     trade_id: i64,
 ) -> Result<()> {
+    if mode == Mode::Observe {
+        return Ok(());
+    }
     let mint = match trade.mint {
         Some(m) => m,
         None => return Ok(()),
@@ -333,24 +659,53 @@ async fn handle_sell(
         "target sell follow"
     );
 
+    if mode == Mode::Live {
+        let Some(executor) = live else {
+            warn!("live mode without executor; skipping sell");
+            return Ok(());
+        };
+        return execute_live_sell(
+            db,
+            http,
+            executor,
+            telegram,
+            bot_wallet,
+            wsol,
+            &mint,
+            session_id,
+            &position,
+            trade,
+        )
+        .await;
+    }
+
     let started = Instant::now();
     let result = jupiter
-        .quote(&mint, wsol, position.entry_out_amount, PAPER_SLIPPAGE_BPS)
+        .quote(&mint, wsol, position.entry_out_amount, DRY_SLIPPAGE_BPS)
         .await;
     let quote_latency_ms = started.elapsed().as_millis() as i32;
+    record_latency(
+        db,
+        session_id,
+        LatencyKind::JupiterQuote,
+        quote_latency_ms,
+        result.is_ok(),
+        result.as_ref().err().map(|e| e.to_string()).as_deref(),
+    )
+    .await;
 
     match result {
         Ok(quote) => {
-            let pt_id = db
-                .paper_trades()
+            let dt_id = db
+                .dry_trades()
                 .insert(
                     session_id,
-                    PaperTradeRecord {
+                    DryTradeRecord {
                         copy_decision_id: None,
                         input_mint: &mint,
                         output_mint: wsol,
                         in_amount: position.entry_out_amount,
-                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        slippage_bps: DRY_SLIPPAGE_BPS,
                         quote: Some(&quote),
                         quote_latency_ms,
                         error: None,
@@ -366,7 +721,7 @@ async fn handle_sell(
                 .positions()
                 .close(
                     position.id,
-                    pt_id,
+                    dt_id,
                     ExitReason::TargetSellFollow,
                     realized_pnl_lamports,
                     realized_pnl_pct,
@@ -377,9 +732,11 @@ async fn handle_sell(
                 return Ok(());
             }
 
+            update_mint_blocklist(db, position.mint, realized_pnl_lamports).await;
+
             info!(
                 position_id = position.id,
-                exit_paper_trade_id = pt_id,
+                exit_dry_trade_id = dt_id,
                 pnl_sol = realized_pnl_lamports as f64 / 1e9,
                 pnl_pct = realized_pnl_pct,
                 "position closed"
@@ -400,17 +757,17 @@ async fn handle_sell(
             notify(telegram, &msg).await;
         }
         Err(e) => {
-            warn!(error = %e, quote_latency_ms, "paper sell quote failed");
+            warn!(error = %e, quote_latency_ms, "dry sell quote failed");
             let msg = e.to_string();
-            db.paper_trades()
+            db.dry_trades()
                 .insert(
                     session_id,
-                    PaperTradeRecord {
+                    DryTradeRecord {
                         copy_decision_id: None,
                         input_mint: &mint,
                         output_mint: wsol,
                         in_amount: position.entry_out_amount,
-                        slippage_bps: PAPER_SLIPPAGE_BPS,
+                        slippage_bps: DRY_SLIPPAGE_BPS,
                         quote: None,
                         quote_latency_ms,
                         error: Some(&msg),
@@ -420,7 +777,7 @@ async fn handle_sell(
             notify(
                 telegram,
                 &format!(
-                    "⚠️ paper sell quote failed\nposition: {}\n{msg}\nlatency: {quote_latency_ms} ms",
+                    "⚠️ dry sell quote failed\nposition: {}\n{msg}\nlatency: {quote_latency_ms} ms",
                     position.id
                 ),
             )
@@ -441,7 +798,7 @@ async fn format_buy_notification(
 ) -> String {
     let mint = match trade.mint {
         Some(m) => m,
-        None => return "💰 paper buy (mint unknown)".to_string(),
+        None => return "💰 dry buy (mint unknown)".to_string(),
     };
     let token = jupiter.token_info(&mint).await;
     let symbol = token
@@ -570,10 +927,12 @@ async fn check_exits(
     db: &Db,
     http: &Http,
     jupiter: &Jupiter,
+    live: Option<&LiveExecutor>,
     telegram: Option<&Telegram>,
     bot_wallet: &Pubkey,
     wsol: &Pubkey,
     session_id: Uuid,
+    mode: Mode,
     params: &ExitParams,
 ) -> Result<()> {
     let positions = db.positions().list_open(session_id).await?;
@@ -584,10 +943,19 @@ async fn check_exits(
                 &position.mint,
                 wsol,
                 position.entry_out_amount,
-                PAPER_SLIPPAGE_BPS,
+                DRY_SLIPPAGE_BPS,
             )
             .await;
         let quote_latency_ms = started.elapsed().as_millis() as i32;
+        record_latency(
+            db,
+            session_id,
+            LatencyKind::JupiterQuote,
+            quote_latency_ms,
+            quote_result.is_ok(),
+            quote_result.as_ref().err().map(|e| e.to_string()).as_deref(),
+        )
+        .await;
 
         let quote = match quote_result {
             Ok(q) => q,
@@ -621,51 +989,77 @@ async fn check_exits(
             current_price,
             entry_price = position.entry_price,
             peak_price = position.peak_price,
+            mode = mode.as_str(),
             "exit triggered"
         );
 
-        let pt_id = db
-            .paper_trades()
+        let (executed_quote, executed_signature) = if mode == Mode::Live {
+            let Some(executor) = live else {
+                warn!(position_id = position.id, "live mode without executor; aborting exit");
+                continue;
+            };
+            match executor
+                .execute_swap(db, session_id, &position.mint, wsol, position.entry_out_amount)
+                .await
+            {
+                Ok(outcome) => (outcome.quote.clone(), Some(outcome.signature)),
+                Err(e) => {
+                    warn!(position_id = position.id, error = %e, "live exit send failed");
+                    continue;
+                }
+            }
+        } else {
+            (quote.clone(), None)
+        };
+
+        let dt_id = db
+            .dry_trades()
             .insert(
                 session_id,
-                PaperTradeRecord {
+                DryTradeRecord {
                     copy_decision_id: None,
                     input_mint: &position.mint,
                     output_mint: wsol,
                     in_amount: position.entry_out_amount,
-                    slippage_bps: PAPER_SLIPPAGE_BPS,
-                    quote: Some(&quote),
+                    slippage_bps: executed_quote.slippage_bps,
+                    quote: Some(&executed_quote),
                     quote_latency_ms,
                     error: None,
                 },
             )
             .await?;
 
-        let realized_pnl_lamports = quote.out_amount as i64 - position.entry_in_lamports as i64;
+        let realized_pnl_lamports =
+            executed_quote.out_amount as i64 - position.entry_in_lamports as i64;
         let realized_pnl_pct =
             realized_pnl_lamports as f64 / position.entry_in_lamports as f64 * 100.0;
 
         let closed = db
             .positions()
-            .close(position.id, pt_id, reason, realized_pnl_lamports, realized_pnl_pct)
+            .close(position.id, dt_id, reason, realized_pnl_lamports, realized_pnl_pct)
             .await?;
         if !closed {
             info!(position_id = position.id, "close race lost; skipping notify");
             continue;
         }
 
-        let msg = format_exit_notification(
+        update_mint_blocklist(db, position.mint, realized_pnl_lamports).await;
+
+        let mut msg = format_exit_notification(
             jupiter,
             http,
             bot_wallet,
             &position,
-            &quote,
+            &executed_quote,
             reason,
             realized_pnl_lamports,
             realized_pnl_pct,
             quote_latency_ms,
         )
         .await;
+        if let Some(sig) = executed_signature {
+            msg.push_str(&format!("\n🚀 live tx: https://solscan.io/tx/{sig}"));
+        }
         notify(telegram, &msg).await;
     }
     Ok(())
