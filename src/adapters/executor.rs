@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use uuid::Uuid;
 
+use crate::adapters::db::live_send_attempts::ClaimResult;
 use crate::adapters::http::SignatureStatus;
 use crate::adapters::tx::sign_versioned_tx_b64;
 use crate::adapters::{Db, Http, Jito, Jupiter, Signer};
@@ -139,10 +140,24 @@ impl LiveExecutor {
             }
         }
 
-        let signed_b64 = sign_versioned_tx_b64(&built.tx_b64, &self.signer)?;
+        let signed = sign_versioned_tx_b64(&built.tx_b64, &self.signer)?;
+
+        match db
+            .live_send_attempts()
+            .try_claim(&signed.signature_b58, session_id)
+            .await?
+        {
+            ClaimResult::Fresh => {}
+            ClaimResult::Duplicate => {
+                anyhow::bail!(
+                    "duplicate signature {} — already attempted (idempotent abort)",
+                    signed.signature_b58
+                );
+            }
+        }
 
         let started = Instant::now();
-        let send_result = self.jito.send_bundle_only(&signed_b64).await;
+        let send_result = self.jito.send_bundle_only(&signed.tx_b64).await;
         let send_latency_ms = started.elapsed().as_millis() as i32;
         let outcome = match send_result {
             Ok(o) => o,
@@ -155,6 +170,10 @@ impl LiveExecutor {
                         false,
                         Some(&e.to_string()),
                     )
+                    .await
+                    .ok();
+                db.live_send_attempts()
+                    .complete(&signed.signature_b58, None, None, false, Some(&e.to_string()))
                     .await
                     .ok();
                 anyhow::bail!("jito send: {e}");
@@ -174,6 +193,16 @@ impl LiveExecutor {
         let confirm_latency_ms = self
             .wait_for_confirmation(db, session_id, &outcome.signature)
             .await;
+        db.live_send_attempts()
+            .complete(
+                &outcome.signature,
+                outcome.bundle_id.as_deref(),
+                Some(&outcome.endpoint),
+                confirm_latency_ms.is_some(),
+                None,
+            )
+            .await
+            .ok();
 
         Ok(LiveOutcome {
             signature: outcome.signature,

@@ -3,7 +3,13 @@ use base64::Engine;
 
 use crate::adapters::signer::Signer;
 
-pub fn sign_versioned_tx_b64(tx_b64: &str, signer: &Signer) -> Result<String> {
+#[derive(Clone, Debug)]
+pub struct SignedTx {
+    pub tx_b64: String,
+    pub signature_b58: String,
+}
+
+pub fn sign_versioned_tx_b64(tx_b64: &str, signer: &Signer) -> Result<SignedTx> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.as_bytes())
         .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
@@ -31,7 +37,10 @@ pub fn sign_versioned_tx_b64(tx_b64: &str, signer: &Signer) -> Result<String> {
     let mut signed = bytes.clone();
     signed[sig_header_len..sig_header_len + 64].copy_from_slice(&signature);
 
-    Ok(base64::engine::general_purpose::STANDARD.encode(&signed))
+    Ok(SignedTx {
+        tx_b64: base64::engine::general_purpose::STANDARD.encode(&signed),
+        signature_b58: bs58::encode(signature).into_string(),
+    })
 }
 
 fn decode_short_vec_u16(bytes: &[u8]) -> Result<(u16, usize)> {

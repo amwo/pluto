@@ -1,6 +1,7 @@
 pub mod copy_decisions;
 pub mod dry_trades;
 pub mod latency_samples;
+pub mod live_send_attempts;
 pub mod mint_blocklist;
 pub mod observed_trades;
 pub mod positions;
@@ -47,6 +48,10 @@ impl Db {
 
     pub fn latency_samples(&self) -> latency_samples::LatencySamples<'_> {
         latency_samples::LatencySamples::new(&self.pool)
+    }
+
+    pub fn live_send_attempts(&self) -> live_send_attempts::LiveSendAttempts<'_> {
+        live_send_attempts::LiveSendAttempts::new(&self.pool)
     }
 
     pub fn reports(&self) -> reports::Reports<'_> {
