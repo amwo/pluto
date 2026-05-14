@@ -31,6 +31,8 @@
         import nixpkgs {
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
+          config.allowUnfreePredicate =
+            pkg: builtins.elem (nixpkgs.lib.getName pkg) [ "terraform" ];
         };
       mkPluto =
         pkgs:
