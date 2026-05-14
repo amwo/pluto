@@ -15,6 +15,12 @@ pub fn sign_versioned_tx_b64(tx_b64: &str, signer: &Signer) -> Result<String> {
     if sig_count == 0 {
         bail!("tx has no signature slots");
     }
+    if sig_count != 1 {
+        bail!(
+            "tx requires {sig_count} signers but pluto only provides 1; \
+             multi-signer txs (Jupiter Z / RFQ) are not supported in self-managed live mode"
+        );
+    }
     let msg_start = sig_header_len + (sig_count as usize) * 64;
     if msg_start > bytes.len() {
         bail!("tx truncated before message body");

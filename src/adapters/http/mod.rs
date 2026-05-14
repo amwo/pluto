@@ -97,6 +97,26 @@ impl Http {
             _ => SignatureStatus::Pending,
         })
     }
+
+    pub async fn get_block_height(&self) -> Result<u64> {
+        let response: Value = self
+            .client
+            .post(&self.endpoint.url)
+            .basic_auth(&self.endpoint.username, Some(&self.endpoint.password))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlockHeight",
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        response["result"]
+            .as_u64()
+            .context("missing block height in response")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +132,7 @@ impl SignatureStatus {
     pub fn is_landed(&self) -> bool {
         matches!(
             self,
-            SignatureStatus::Processed | SignatureStatus::Confirmed | SignatureStatus::Finalized
+            SignatureStatus::Confirmed | SignatureStatus::Finalized
         )
     }
 }

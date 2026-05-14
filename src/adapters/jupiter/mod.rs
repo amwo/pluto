@@ -127,6 +127,8 @@ impl Jupiter {
             "quoteResponse": quote.raw_quote,
             "userPublicKey": taker.to_string(),
             "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+            "prioritizationFeeLamports": "auto",
         });
         let response: Value = self
             .client

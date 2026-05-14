@@ -10,7 +10,9 @@ use crate::domain::{LatencyKind, Pubkey, Quote};
 
 const LIVE_SLIPPAGE_BPS: u32 = 200;
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(400);
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+const BLOCKHASH_MIN_REMAINING: u64 = 30;
+const FEE_BUFFER_LAMPORTS: u64 = 10_000_000;
 
 pub struct LiveExecutor {
     jupiter: Jupiter,
@@ -54,6 +56,7 @@ impl LiveExecutor {
         amount: u64,
     ) -> Result<LiveOutcome> {
         let taker = self.signer.pubkey();
+        self.preflight_balance(&taker, amount, input_mint).await?;
 
         let started = Instant::now();
         let order_result = self
@@ -121,6 +124,21 @@ impl LiveExecutor {
             .await
             .ok();
 
+        if let Some(last_valid) = built.last_valid_block_height {
+            match self.http.get_block_height().await {
+                Ok(current) => {
+                    if last_valid <= current.saturating_add(BLOCKHASH_MIN_REMAINING) {
+                        anyhow::bail!(
+                            "blockhash too old: last_valid={last_valid} current={current} (min remaining {BLOCKHASH_MIN_REMAINING})"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "get_block_height failed; sending without TTL gate");
+                }
+            }
+        }
+
         let signed_b64 = sign_versioned_tx_b64(&built.tx_b64, &self.signer)?;
 
         let started = Instant::now();
@@ -170,6 +188,28 @@ impl LiveExecutor {
 
     pub fn taker(&self) -> Pubkey {
         self.signer.pubkey()
+    }
+
+    async fn preflight_balance(
+        &self,
+        taker: &Pubkey,
+        amount: u64,
+        input_mint: &Pubkey,
+    ) -> Result<()> {
+        let balance = self.http.get_balance(taker).await?;
+        let wsol = Pubkey::from_base58("So11111111111111111111111111111111111111112")
+            .expect("wsol mint");
+        let required = if *input_mint == wsol {
+            amount.saturating_add(FEE_BUFFER_LAMPORTS)
+        } else {
+            FEE_BUFFER_LAMPORTS
+        };
+        if balance < required {
+            anyhow::bail!(
+                "wallet balance {balance} lamports below required {required} (amount={amount}, fee_buffer={FEE_BUFFER_LAMPORTS})"
+            );
+        }
+        Ok(())
     }
 
     async fn wait_for_confirmation(
