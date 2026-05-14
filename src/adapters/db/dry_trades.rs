@@ -4,12 +4,12 @@ use uuid::Uuid;
 
 use crate::domain::{Pubkey, Quote};
 
-pub struct PaperTrades<'a> {
+pub struct DryTrades<'a> {
     pool: &'a PgPool,
 }
 
 #[derive(Clone, Debug)]
-pub struct PaperTradeRecord<'a> {
+pub struct DryTradeRecord<'a> {
     pub copy_decision_id: Option<i64>,
     pub input_mint: &'a Pubkey,
     pub output_mint: &'a Pubkey,
@@ -20,12 +20,12 @@ pub struct PaperTradeRecord<'a> {
     pub error: Option<&'a str>,
 }
 
-impl<'a> PaperTrades<'a> {
+impl<'a> DryTrades<'a> {
     pub(super) fn new(pool: &'a PgPool) -> Self {
         Self { pool }
     }
 
-    pub async fn insert(&self, session_id: Uuid, record: PaperTradeRecord<'_>) -> Result<i64> {
+    pub async fn insert(&self, session_id: Uuid, record: DryTradeRecord<'_>) -> Result<i64> {
         let input_mint = record.input_mint.as_bytes().to_vec();
         let output_mint = record.output_mint.as_bytes().to_vec();
         let in_amount: i64 = i64::try_from(record.in_amount).context("in_amount exceeds BIGINT")?;
@@ -44,7 +44,7 @@ impl<'a> PaperTrades<'a> {
         let route_labels: Option<Vec<String>> = record.quote.map(|q| q.route_labels.clone());
 
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO paper_trades (
+            "INSERT INTO dry_trades (
                 session_id, copy_decision_id, input_mint, output_mint,
                 in_amount, out_amount, other_amount_threshold,
                 price_impact_bps, slippage_bps, route_labels,

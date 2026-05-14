@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Observe,
-    Paper,
+    Dry,
     Live,
 }
 
@@ -13,7 +13,7 @@ impl Mode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Mode::Observe => "observe",
-            Mode::Paper => "paper",
+            Mode::Dry => "dry",
             Mode::Live => "live",
         }
     }
@@ -25,7 +25,7 @@ impl FromStr for Mode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "observe" => Ok(Mode::Observe),
-            "paper" => Ok(Mode::Paper),
+            "dry" => Ok(Mode::Dry),
             "live" => Ok(Mode::Live),
             other => Err(ModeParseError(other.to_string())),
         }
