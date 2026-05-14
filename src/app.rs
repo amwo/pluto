@@ -1005,7 +1005,8 @@ async fn check_exits(
             "exit triggered"
         );
 
-        let (executed_quote, executed_signature) = if mode == Mode::Live {
+        let (executed_quote, executed_signature, executed_quote_latency_ms) = if mode == Mode::Live
+        {
             let Some(executor) = live else {
                 warn!(position_id = position.id, "live mode without executor; aborting exit");
                 continue;
@@ -1018,7 +1019,11 @@ async fn check_exits(
                 .execute_swap(db, session_id, &position.mint, wsol, position.entry_out_amount)
                 .await
             {
-                Ok(outcome) => (outcome.quote.clone(), Some(outcome.signature)),
+                Ok(outcome) => (
+                    outcome.quote.clone(),
+                    Some(outcome.signature),
+                    outcome.quote_latency_ms,
+                ),
                 Err(e) => {
                     db.positions().release_claim(position.id).await.ok();
                     warn!(position_id = position.id, error = %e, "live exit send failed");
@@ -1026,7 +1031,7 @@ async fn check_exits(
                 }
             }
         } else {
-            (quote.clone(), None)
+            (quote.clone(), None, quote_latency_ms)
         };
 
         let dt_id = db
@@ -1040,7 +1045,7 @@ async fn check_exits(
                     in_amount: position.entry_out_amount,
                     slippage_bps: executed_quote.slippage_bps,
                     quote: Some(&executed_quote),
-                    quote_latency_ms,
+                    quote_latency_ms: executed_quote_latency_ms,
                     error: None,
                 },
             )

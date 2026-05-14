@@ -86,26 +86,24 @@ impl Jupiter {
         })
     }
 
-    pub async fn quote_raw(
+    pub async fn quote_v1(
         &self,
         input_mint: &Pubkey,
         output_mint: &Pubkey,
         amount: u64,
         slippage_bps: u32,
-        taker: &Pubkey,
     ) -> Result<SwapResponse> {
         self.throttle().await;
 
         let response: Value = self
             .client
-            .get(format!("{API_BASE}/swap/v2/order"))
+            .get(format!("{API_BASE}/swap/v1/quote"))
             .query(&[
                 ("inputMint", input_mint.to_string()),
                 ("outputMint", output_mint.to_string()),
                 ("amount", amount.to_string()),
                 ("slippageBps", slippage_bps.to_string()),
                 ("swapMode", "ExactIn".to_string()),
-                ("taker", taker.to_string()),
             ])
             .send()
             .await?
@@ -113,21 +111,38 @@ impl Jupiter {
             .json()
             .await?;
 
-        let request_id = response["requestId"].as_str().map(|s| s.to_string());
         Ok(SwapResponse {
             raw_quote: response,
-            request_id,
+            request_id: None,
         })
     }
 
-    pub async fn build_swap(&self, order: &SwapResponse) -> Result<BuiltSwap> {
+    pub async fn build_swap_v1(
+        &self,
+        quote: &SwapResponse,
+        taker: &Pubkey,
+    ) -> Result<BuiltSwap> {
         self.throttle().await;
-        let tx_b64 = order.raw_quote["transaction"]
+        let body = serde_json::json!({
+            "quoteResponse": quote.raw_quote,
+            "userPublicKey": taker.to_string(),
+            "wrapAndUnwrapSol": true,
+        });
+        let response: Value = self
+            .client
+            .post(format!("{API_BASE}/swap/v1/swap"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let tx_b64 = response["swapTransaction"]
             .as_str()
-            .or_else(|| order.raw_quote["swapTransaction"].as_str())
-            .context("swap order missing transaction field")?
+            .context("swap response missing swapTransaction")?
             .to_string();
-        let last_valid_block_height = order.raw_quote["lastValidBlockHeight"].as_u64();
+        let last_valid_block_height = response["lastValidBlockHeight"].as_u64();
         Ok(BuiltSwap {
             tx_b64,
             last_valid_block_height,

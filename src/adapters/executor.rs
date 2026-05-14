@@ -47,7 +47,7 @@ impl LiveExecutor {
         let started = Instant::now();
         let order_result = self
             .jupiter
-            .quote_raw(input_mint, output_mint, amount, LIVE_SLIPPAGE_BPS, &taker)
+            .quote_v1(input_mint, output_mint, amount, LIVE_SLIPPAGE_BPS)
             .await;
         let quote_latency_ms = started.elapsed().as_millis() as i32;
         let order = match &order_result {
@@ -81,7 +81,7 @@ impl LiveExecutor {
         let quote = quote_from_order(input_mint, output_mint, &order)?;
 
         let started = Instant::now();
-        let built_result = self.jupiter.build_swap(&order).await;
+        let built_result = self.jupiter.build_swap_v1(&order, &taker).await;
         let swap_latency_ms = started.elapsed().as_millis() as i32;
         let built = match built_result {
             Ok(b) => b,
