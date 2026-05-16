@@ -1,0 +1,6 @@
+jobs:
+  - name: nightly-dreaming
+    schedule: "0 3 * * *"
+    store: team_sre
+    apply: false
+    command: "dreamer --store team_sre"

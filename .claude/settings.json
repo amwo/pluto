@@ -1,7 +1,51 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
-    "Stop": [
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash memory/scripts/transcript-hook.sh SessionStart 2>/dev/null || true",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash memory/scripts/transcript-hook.sh UserPromptSubmit 2>/dev/null || true",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash memory/scripts/transcript-hook.sh PostToolUse 2>/dev/null || true",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash memory/scripts/transcript-hook.sh PostToolUseFailure 2>/dev/null || true",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
       {
         "hooks": [
           {
