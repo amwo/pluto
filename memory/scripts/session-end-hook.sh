@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${MEMORY_ROOT:-memory}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${MEMORY_ROOT:-${HERE}/..}"
 STORE="${1:-team_sre}"
-DREAMER="${DREAMER:-dreamer}"
+
+if [ -n "${DREAMER:-}" ]; then
+  :
+elif [ -x "${HERE}/../target/release/dreamer" ]; then
+  DREAMER="${HERE}/../target/release/dreamer"
+elif [ -x "${HERE}/../target/debug/dreamer" ]; then
+  DREAMER="${HERE}/../target/debug/dreamer"
+else
+  DREAMER="dreamer"
+fi
 
 if [ -n "${MEMORY_SESSION_ID:-}" ]; then
   META="${ROOT}/sessions/${MEMORY_SESSION_ID}/meta.json"
